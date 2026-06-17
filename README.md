@@ -50,16 +50,18 @@ See [`docs/playback-on-pi5.md`](docs/playback-on-pi5.md) for the hardware detail
 ## Install (autostart on boot)
 
 ```bash
-git clone https://github.com/davidblikstad-spec/mediaplayer-rpi5-4k.git /home/david/mediaplayer
-cd /home/david/mediaplayer
+git clone https://github.com/davidblikstad-spec/mediaplayer-rpi5-4k.git
+cd mediaplayer-rpi5-4k
 sudo ./install.sh
 ```
 
 `install.sh` installs the GStreamer HEVC HW-decode stack + PyGObject + ffmpeg,
 creates the Python venv (with system site-packages so `gi` is importable) and
 installs the Python deps, then a systemd service that takes over **tty1** (the
-HDMI console) so the player can drive the display, and starts it on boot. Then
-browse to `http://<pi-ip>:8080` and create your admin account on first visit.
+HDMI console) so the player can drive the display, and starts it on boot. The
+service is generated with the actual install path and user, so you can clone it
+anywhere. Then browse to `http://<pi-ip>:8080` and create your admin account on
+first visit.
 
 > The service runs a login session on tty1 (`PAMName=login`) so it becomes the
 > active seat session — required to get DRM master and output to HDMI.
@@ -71,7 +73,7 @@ active and your cable/display negotiate 2160p.
 ## Run manually (for testing)
 
 ```bash
-cd /home/david/mediaplayer
+cd mediaplayer-rpi5-4k
 ./venv/bin/python run.py
 ```
 Note: run from the **active console**, not over SSH — the player needs DRM

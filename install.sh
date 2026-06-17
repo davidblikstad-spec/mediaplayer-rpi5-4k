@@ -43,8 +43,13 @@ echo "==> Installing Python dependencies into the venv"
 sudo -u "$RUN_USER" "$DIR/venv/bin/pip" install --upgrade pip >/dev/null
 sudo -u "$RUN_USER" "$DIR/venv/bin/pip" install -r "$DIR/requirements.txt"
 
-echo "==> Installing systemd unit"
-install -m 644 "$DIR/mediaplayer.service" /etc/systemd/system/mediaplayer.service
+echo "==> Installing systemd unit (paths/user filled in for this install)"
+RUN_UID="$(id -u "$RUN_USER")"
+sed -e "s|__USER__|$RUN_USER|g" \
+    -e "s|__UID__|$RUN_UID|g" \
+    -e "s|__DIR__|$DIR|g" \
+    "$DIR/mediaplayer.service" > /etc/systemd/system/mediaplayer.service
+chmod 644 /etc/systemd/system/mediaplayer.service
 systemctl daemon-reload
 
 echo "==> Freeing tty1 (disabling text login on tty1 so the player owns HDMI)"

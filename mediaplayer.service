@@ -7,7 +7,9 @@ After=getty@tty1.service
 
 [Service]
 Type=simple
-User=david
+# __USER__, __UID__ and __DIR__ are filled in by install.sh from the invoking
+# user and the directory it's run from, so this works wherever you clone it.
+User=__USER__
 # A login session on tty1 makes this the active session on seat0, which is
 # required for the GStreamer kmssink DRM/KMS output to become DRM master (HDMI).
 PAMName=login
@@ -16,9 +18,9 @@ StandardInput=tty
 StandardOutput=journal
 StandardError=journal
 SupplementaryGroups=video render input audio tty
-WorkingDirectory=/home/david/mediaplayer
-Environment=XDG_RUNTIME_DIR=/run/user/1000
-ExecStart=/home/david/mediaplayer/venv/bin/python /home/david/mediaplayer/run.py
+WorkingDirectory=__DIR__
+Environment=XDG_RUNTIME_DIR=/run/user/__UID__
+ExecStart=__DIR__/venv/bin/python __DIR__/run.py
 Restart=always
 RestartSec=3
 
