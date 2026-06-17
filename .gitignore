@@ -1,0 +1,22 @@
+# Python virtual environment
+venv/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Runtime config — contains password hash and secret key
+data/config.json
+data/*.tmp
+
+# Disk-backed temp dir for large uploads (see run.py)
+data/tmp/
+
+# User-uploaded media and generated artifacts (recreated at runtime)
+media/
+thumbs/
+previews/
+
+# Editor / OS cruft
+*.swp
+.DS_Store

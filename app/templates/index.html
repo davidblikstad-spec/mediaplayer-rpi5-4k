@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>The Event AS - Media scheduler</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <header>
+    <div class="brand">▶ The Event AS - Media scheduler</div>
+    <nav id="tabs">
+      <button data-tab="now" class="active">Now Playing</button>
+      <button data-tab="playlists">Playlists</button>
+      <button data-tab="schedules">Schedules</button>
+      <button data-tab="media">Media Library</button>
+      <button data-tab="settings">Settings</button>
+    </nav>
+    <div class="user">{{ username }} · <a href="{{ url_for('logout') }}">sign out</a></div>
+  </header>
+
+  <main>
+    <!-- NOW PLAYING -->
+    <section id="tab-now" class="tab active">
+      <div class="grid2">
+        <div class="card">
+          <h2>HDMI Output</h2>
+          <div class="hdmi"><img id="snapshot" alt="HDMI preview"><div id="snapshot-empty" class="muted">no preview yet</div></div>
+          <label class="inline"><input type="checkbox" id="snap-auto" checked> auto-refresh</label>
+        </div>
+        <div class="card">
+          <h2>Status</h2>
+          <div id="status-box" class="status"></div>
+          <div class="controls">
+            <button id="btn-pause">Pause / Resume</button>
+            <button id="btn-next">Next</button>
+            <button id="btn-stop">Stop → default</button>
+          </div>
+          <h3>Quick play</h3>
+          <div id="quickplay" class="chips"></div>
+          <h3>Display (HDMI-CEC)</h3>
+          <div class="controls">
+            <button data-cec="on">Display On</button>
+            <button data-cec="off">Display Off</button>
+            <button data-cec="source">Set as Source</button>
+          </div>
+          <pre id="cec-out" class="log"></pre>
+        </div>
+      </div>
+    </section>
+
+    <!-- PLAYLISTS -->
+    <section id="tab-playlists" class="tab">
+      <div class="toolbar">
+        <select id="pl-select"></select>
+        <button id="pl-new">+ New</button>
+        <button id="pl-rename">Rename</button>
+        <button id="pl-delete" class="danger">Delete</button>
+        <span class="spacer"></span>
+        <button id="pl-play" class="primary">▶ Play now</button>
+      </div>
+      <div class="card">
+        <label class="inline"><input type="checkbox" id="pl-loop"> Loop whole playlist</label>
+        <button id="pl-add" class="small">+ Add file</button>
+        <button id="pl-add-stream" class="small">+ Add live channel</button>
+        <button id="pl-save" class="primary small">Save playlist</button>
+        <table id="pl-items" class="items">
+          <thead><tr>
+            <th></th><th>File</th><th>Type</th><th>In</th><th>Out / Dur</th>
+            <th>Loops</th><th>Vol</th><th>Fade in</th><th>Fade out</th><th></th>
+          </tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- SCHEDULES -->
+    <section id="tab-schedules" class="tab">
+      <div class="toolbar">
+        <button id="sch-new">+ New schedule</button>
+      </div>
+      <div id="sch-list"></div>
+    </section>
+
+    <!-- MEDIA -->
+    <section id="tab-media" class="tab">
+      <div id="dropzone" class="dropzone">
+        <button id="upload-btn" class="primary">+ Add media</button>
+        <input type="file" id="upload-input" accept="video/*,image/*" multiple hidden>
+        <span class="muted">or drag files here</span>
+        <span id="upload-status" class="muted"></span>
+      </div>
+      <div id="upload-progress" class="upload-progress hidden">
+        <div class="progress-track"><div id="upload-bar" class="progress-fill"></div></div>
+        <button id="upload-cancel" class="small danger">Cancel</button>
+      </div>
+      <div id="transcode-list"></div>
+      <div id="media-grid" class="media-grid"></div>
+    </section>
+
+    <!-- SETTINGS -->
+    <section id="tab-settings" class="tab">
+      <div class="card">
+        <h2>Default content</h2>
+        <p class="muted">Played on a loop whenever nothing else is scheduled or playing.</p>
+        <select id="set-default"></select>
+        <div class="row">
+          <label>Default image duration (s)<input id="set-default-dur" type="number" min="1" value="10"></label>
+        </div>
+      </div>
+      <div class="card">
+        <h2>HDMI-CEC</h2>
+        <div class="row">
+          <label>CEC device<input id="set-cec-dev" value="/dev/cec0"></label>
+          <label>Physical address (e.g. 0x1000)<input id="set-cec-phys" placeholder="auto-detect"></label>
+          <button id="cec-detect">Detect</button>
+        </div>
+        <pre id="cec-info" class="log"></pre>
+      </div>
+      <div class="card">
+        <h2>Playback</h2>
+        <div class="row">
+          <label>Audio output
+            <select id="set-ao">
+              <option value="auto">Auto (system default)</option>
+              <option value="sysdefault:CARD=vc4hdmi">HDMI</option>
+              <option value="sysdefault:CARD=Headphones">Analog (3.5mm minijack)</option>
+            </select>
+          </label>
+          <span class="muted">Applied on Save (briefly reloads the current item).</span>
+        </div>
+        <div class="row">
+          <label>HDMI snapshot interval (s)<input id="set-snap" type="number" min="1" value="5"></label>
+          <label>Live stream audio delay (ms, 0=auto)<input id="set-avdelay" type="number" min="0" step="10" value="0"></label>
+        </div>
+      </div>
+      <div class="card">
+        <h2>Transcoding</h2>
+        <p class="muted">The Pi 5 plays 4K natively — HEVC in hardware, H.264 in
+          software. Transcoding is optional; choose what to do automatically when
+          a file is uploaded. You can also transcode any file by hand from the
+          Media Library. (Encoding is software-only on the Pi 5 — it can be slow.)</p>
+        <div class="row">
+          <label>Auto-transcode on upload
+            <select id="set-tc-policy">
+              <option value="off">Off — keep originals, play natively (recommended)</option>
+              <option value="hevc">To HEVC — convert &gt;1080p non-HEVC to 4K HEVC (hardware decode)</option>
+              <option value="1080p">To 1080p — shrink anything over 1080p to 1080p H.264</option>
+            </select>
+          </label>
+        </div>
+        <button id="set-save" class="primary">Save settings</button>
+      </div>
+      <div class="card">
+        <h2>Change credentials</h2>
+        <div class="row">
+          <label>Username<input id="pw-user"></label>
+          <label>Current password<input id="pw-old" type="password"></label>
+          <label>New password<input id="pw-new" type="password"></label>
+          <button id="pw-save">Update</button>
+        </div>
+        <span id="pw-status" class="muted"></span>
+      </div>
+    </section>
+  </main>
+
+  <!-- media picker / preview modal -->
+  <div id="modal" class="modal hidden">
+    <div class="modal-body">
+      <button id="modal-close" class="modal-close">×</button>
+      <div id="modal-content"></div>
+    </div>
+  </div>
+
+  <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>

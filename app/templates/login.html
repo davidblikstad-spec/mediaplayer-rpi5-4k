@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sign in — The Event AS - Media scheduler</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body class="centered">
+  <form class="card auth" method="post">
+    <h1>The Event AS - Media scheduler</h1>
+    <p class="muted">Sign in to configure</p>
+    {% if error %}<div class="error">{{ error }}</div>{% endif %}
+    <label>Username<input name="username" autocomplete="username" autofocus></label>
+    <label>Password<input name="password" type="password" autocomplete="current-password"></label>
+    <button type="submit">Sign in</button>
+  </form>
+</body>
+</html>

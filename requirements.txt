@@ -1,0 +1,5 @@
+# Python dependencies for the media player web app.
+# (GStreamer/PyGObject 'gi' comes from system packages via --system-site-packages.)
+Flask>=3.0
+waitress>=3.0
+APScheduler>=3.10
