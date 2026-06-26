@@ -34,6 +34,7 @@ def _defaults():
             "audio_out": "auto",           # ALSA device: "auto", HDMI or analog
             "screenshot_interval": 5,      # seconds between HDMI snapshots
             "stream_av_delay_ms": 0,       # manual extra delay for stream audio (ms)
+            "stream_resync_interval_s": 3600,  # re-sync stream audio every N s (0=off)
             # Auto-transcode policy applied on upload (see app/transcode.py):
             #   "off"   — never; play everything natively (4K HEVC in hardware,
             #             H.264 in software). Default — the Pi 5 plays 4K.

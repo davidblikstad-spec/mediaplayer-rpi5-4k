@@ -45,6 +45,13 @@ STREAM_SYNC_HOLD_S = 3.0
 # Optional extra audio delay (ms) applied after the flip, as a manual nudge if
 # the auto-alignment leaves a residual offset. Overridden by stream_av_delay_ms.
 STREAM_AV_DELAY_MS = 0
+# Once free-floating, a live stream's audio can slowly drift from video as the
+# ALSA hardware clock and the stream clock diverge. Every this-many seconds we
+# briefly re-engage clock sync (the same STREAM_SYNC_HOLD_S dance as startup) to
+# re-align, bounding that drift. 0 disables. Overridden by
+# stream_resync_interval_s. Each cycle costs a tiny audio hiccup as the sink
+# re-engages the clock — negligible once an hour.
+STREAM_RESYNC_INTERVAL_S = 3600
 
 
 class GstPlayer:
@@ -70,7 +77,9 @@ class GstPlayer:
         self._asink = None                   # alsasink element (clock-sync toggle)
         self._adelay = None                  # queue before the sink (A/V delay)
         self._av_delay_ms = STREAM_AV_DELAY_MS
+        self._resync_interval_s = STREAM_RESYNC_INTERVAL_S
         self._sync_timer = None              # flips stream audio to free-float
+        self._resync_timer = None            # periodic re-sync of stream audio
         self._shot_lock = threading.Lock()   # single-flight HDMI snapshots
 
     # ---- lifecycle --------------------------------------------------------
@@ -81,6 +90,7 @@ class GstPlayer:
             cfg = config.load()["settings"]
             self.set_audio_device(cfg.get("audio_out"))
             self.set_av_delay(cfg.get("stream_av_delay_ms"))
+            self.set_resync_interval(cfg.get("stream_resync_interval_s"))
         except Exception:
             pass
         self._build_playbin()
@@ -237,6 +247,7 @@ class GstPlayer:
         pb.set_state(Gst.State.PLAYING)
         if is_url:
             self._arm_sync_flip()
+            self._arm_periodic_resync()
 
     def _arm_sync_flip(self):
         """After a short synced hold, flip the audio sink to free-float so a live
@@ -250,6 +261,33 @@ class GstPlayer:
         t = threading.Timer(STREAM_SYNC_HOLD_S, flip)
         t.daemon = True
         self._sync_timer = t
+        t.start()
+
+    def _arm_periodic_resync(self):
+        """Every _resync_interval_s, briefly re-engage clock sync to re-align a
+        long-running stream's audio with video, then free-float again — bounding
+        the drift that builds up under sync=false. 0 disables. Reschedules itself
+        for as long as the same stream keeps playing (guarded by _gen)."""
+        interval = self._resync_interval_s
+        if not interval or interval <= 0:
+            return
+        gen = self._gen
+        def resync():
+            if gen != self._gen or self._cur_kind != "stream" or self._asink is None:
+                return
+            self._asink.set_property("sync", True)   # re-align A/V
+            self.log("stream audio: periodic re-sync")
+            def release():
+                if gen != self._gen or self._asink is None:
+                    return
+                self._asink.set_property("sync", False)
+            rt = threading.Timer(STREAM_SYNC_HOLD_S, release)
+            rt.daemon = True
+            rt.start()
+            self._arm_periodic_resync()              # schedule the next cycle
+        t = threading.Timer(interval, resync)
+        t.daemon = True
+        self._resync_timer = t
         t.start()
 
     def _play_image(self, path, dur):
@@ -303,6 +341,9 @@ class GstPlayer:
         if self._sync_timer is not None:
             self._sync_timer.cancel()
             self._sync_timer = None
+        if self._resync_timer is not None:
+            self._resync_timer.cancel()
+            self._resync_timer = None
 
     def _stop_video(self):
         if self.playbin is not None:
@@ -390,6 +431,21 @@ class GstPlayer:
         if self._cur_kind == "stream" and self._adelay is not None:
             self._adelay.set_property("min-threshold-time", ms * Gst.MSECOND)
         self.log("stream A/V delay set to %d ms" % ms)
+
+    def set_resync_interval(self, seconds):
+        """Set how often (s) a playing live stream re-syncs its audio to video.
+        0 = off. Re-arms live if a stream is currently playing."""
+        try:
+            seconds = max(0, int(seconds))
+        except (TypeError, ValueError):
+            return
+        self._resync_interval_s = seconds
+        if self._cur_kind == "stream":
+            if self._resync_timer is not None:
+                self._resync_timer.cancel()
+                self._resync_timer = None
+            self._arm_periodic_resync()
+        self.log("stream re-sync interval set to %d s" % seconds)
 
     # DRM/raw fourcc -> GStreamer raw format, for packed 4:2:0 frames we can
     # re-wrap and JPEG-encode cheaply
