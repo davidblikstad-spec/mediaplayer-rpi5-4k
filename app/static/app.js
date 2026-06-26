@@ -518,6 +518,7 @@ function renderSettings() {
   $("#set-cec-phys").value = s.cec_phys_addr || "";
   $("#set-snap").value = s.screenshot_interval || 5;
   $("#set-avdelay").value = s.stream_av_delay_ms ?? 0;
+  $("#set-resync").value = Math.round((s.stream_resync_interval_s ?? 3600) / 60);
   $("#set-ao").value = (s.audio_out || "auto").replace(/^alsa\//, "");
   $("#set-tc-policy").value = s.transcode_policy || "off";
   $("#pw-user").value = (cfg.auth && cfg.auth.username) || "";
@@ -544,6 +545,7 @@ $("#set-save").onclick = async () => {
     cec_phys_addr: $("#set-cec-phys").value,
     screenshot_interval: parseInt($("#set-snap").value) || 5,
     stream_av_delay_ms: parseInt($("#set-avdelay").value) || 0,
+    stream_resync_interval_s: (parseInt($("#set-resync").value) || 0) * 60,
     audio_out: $("#set-ao").value,
     transcode_policy: $("#set-tc-policy").value,
     default_item: def,
