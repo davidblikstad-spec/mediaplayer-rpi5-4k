@@ -62,7 +62,8 @@ class GstPlayer:
         self.event_handlers = []          # list of callables(event_dict)
         self._lock = threading.RLock()
         self.playbin = None               # reused playbin3 for video/audio
-        self.imgpipe = None               # per-image pipeline (rebuilt each time)
+        self.imgpipe = None               # per-image pipeline
+        self._img_shown_path = None       # file on the live image pipeline
         self._active_bus = None           # bus the watcher polls
         self._gen = 0                     # cancels stale image timers
         self._img_timer = None
@@ -291,6 +292,16 @@ class GstPlayer:
         t.start()
 
     def _play_image(self, path, dur):
+        # If this exact still image is already on a live pipeline, don't rebuild:
+        # imagefreeze holds the frame indefinitely, so tearing the pipeline down
+        # and building a new one every `dur` seconds is pointless and harmful —
+        # it churns the kmssink/DRM plane, orphaning pipelines (leaking threads/
+        # fds/memory) and can wedge HDMI. Just re-arm the advance timer so
+        # multi-item playlists still rotate.
+        if self.imgpipe is not None and self._img_shown_path == path:
+            self._arm_image_timer(dur)
+            return
+        self._stop_image()   # switching images: fully tear the previous one down
         pipe = Gst.Pipeline.new("imgpipe")
         src = Gst.ElementFactory.make("filesrc", None)
         dec = Gst.ElementFactory.make("decodebin", None)
@@ -310,6 +321,7 @@ class GstPlayer:
         dec.connect("pad-added",
                     lambda _dbin, pad: pad.link(freeze.get_static_pad("sink")))
         self.imgpipe = pipe
+        self._img_shown_path = path
         self._active_bus = pipe.get_bus()
         pipe.set_state(Gst.State.PLAYING)
         # images don't EOS (imagefreeze loops); advance via a timer instead
@@ -353,6 +365,7 @@ class GstPlayer:
         if self.imgpipe is not None:
             self.imgpipe.set_state(Gst.State.NULL)
             self.imgpipe = None
+        self._img_shown_path = None
 
     def stop(self):
         """Blank the screen and play nothing (releases the DRM plane)."""
