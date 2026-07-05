@@ -33,6 +33,57 @@ UHD_W, UHD_H = 3840, 2160
 # The Pi 5 hardware-decodes HEVC (H.265) only; everything else is software.
 HW_DECODE_CODECS = {"hevc", "h265"}
 
+
+def needs_image_downscale(width):
+    """True if an image is wider than the 4K display (UHD_W). Images at or below
+    that width are left untouched — we only ever downscale, never upscale."""
+    return bool(width and width > UHD_W)
+
+
+def downscale_image(rel, log=print):
+    """Scale an oversized image down to UHD_W (4K) wide, preserving aspect ratio,
+    in place. Returns True if the file was rewritten.
+
+    Unlike the video transcode (backgrounded, progress-tracked), an image resize
+    is sub-second, so this is synchronous. Mirrors the fit-and-replace shape:
+    resize to a temp file, atomically swap it in, refresh the thumbnail.
+    `scale='min(W,iw)'` guarantees we never upscale."""
+    try:
+        src = media.abs_path(rel)
+    except Exception as e:  # noqa
+        log("image downscale: bad path %s: %s" % (rel, e))
+        return False
+    if media.media_type(rel) != "image" or not os.path.exists(src):
+        return False
+    root, ext = os.path.splitext(src)
+    tmp_abs = "%s.resizing.part%s" % (root, ext)   # keep ext so ffmpeg picks the format
+    vf = "scale='min(%d,iw)':-1" % UHD_W           # cap width, height auto (keep ratio)
+    cmd = ["ffmpeg", "-hide_banner", "-nostdin", "-y", "-i", src, "-vf", vf, tmp_abs]
+    log("image downscale start: %s" % rel)
+    try:
+        r = subprocess.run(cmd, capture_output=True, timeout=120)
+        if r.returncode != 0 or not os.path.exists(tmp_abs):
+            log("image downscale failed: %s: %s"
+                % (rel, (r.stderr or b"")[-300:].decode("utf-8", "replace")))
+            _rm(tmp_abs)
+            return False
+        os.replace(tmp_abs, src)
+        try:
+            media.thumbnail(rel)
+        except Exception:  # noqa
+            pass
+        log("image downscale done: %s" % rel)
+        return True
+    except FileNotFoundError:
+        log("image downscale: ffmpeg not installed")
+        _rm(tmp_abs)
+        return False
+    except Exception as e:  # noqa
+        log("image downscale error: %s: %s" % (rel, e))
+        _rm(tmp_abs)
+        return False
+
+
 # job registry, keyed by the uploaded file's media-relative name
 _jobs = {}
 _lock = threading.Lock()
