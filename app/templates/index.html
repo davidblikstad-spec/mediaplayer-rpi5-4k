@@ -137,16 +137,19 @@
       </div>
       <div class="card">
         <h2>Transcoding</h2>
-        <p class="muted">The Pi 5 plays 4K natively — HEVC in hardware, H.264 in
-          software. Transcoding is optional; choose what to do automatically when
-          a file is uploaded. You can also transcode any file by hand from the
-          Media Library. (Encoding is software-only on the Pi 5 — it can be slow.)</p>
+        <p class="muted">Every codec is decoded in software on this Pi, so
+          <b>1080p is the comfortable ceiling</b> and anything larger may stutter.
+          Transcoding is optional; choose what to do automatically when a file is
+          uploaded. You can also transcode any file by hand from the Media
+          Library. (Encoding is software-only on the Pi 5 — it can be slow.)</p>
         <div class="row">
           <label>Auto-transcode on upload
             <select id="set-tc-policy">
-              <option value="off">Off — keep originals, play natively (recommended)</option>
+              <option value="off">Off — keep originals as uploaded</option>
+              <option value="1080p">To 1080p — shrink anything over 1080p to 1080p H.264 (recommended)</option>
+              <!-- Only useful with the hardware HEVC decoder enabled; app.js
+                   hides this option while it is off. -->
               <option value="hevc">To HEVC — convert &gt;1080p non-HEVC to 4K HEVC (hardware decode)</option>
-              <option value="1080p">To 1080p — shrink anything over 1080p to 1080p H.264</option>
             </select>
           </label>
         </div>

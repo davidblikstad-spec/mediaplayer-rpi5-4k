@@ -39,6 +39,9 @@ def _public_config(cfg):
     c = copy.deepcopy(cfg)
     c.get("auth", {}).pop("password_hash", None)
     c.get("settings", {}).pop("secret_key", None)
+    # Build-time capability, not a user setting: the UI hides the "→ HEVC"
+    # transcode option (and its badge) while the hardware decoder is disabled.
+    c["hw_hevc_decode"] = config.HW_HEVC_DECODE
     return c
 
 
@@ -168,9 +171,9 @@ def create_app():
             it["thumb"] = media.thumbnail(it["file"])
             info = media.probe(it["file"])
             it.update(info)
-            # How this will play on the Pi 5: "hw" (hardware HEVC), "sw"
-            # (software <=1080p), or "heavy" (software >1080p — may stutter,
-            # transcoding offered). Non-videos always play.
+            # How this will play on the Pi 5: "sw" (software <=1080p) or "heavy"
+            # (software >1080p — may stutter, shrinking offered). "hw" only
+            # appears while config.HW_HEVC_DECODE is on. Non-videos always play.
             it["play_mode"] = (
                 transcode.playback_mode(info.get("width"), info.get("height"),
                                         info.get("codec"))
@@ -233,7 +236,14 @@ def create_app():
             return jsonify({"error": "not found"}), 404
         if media.media_type(rel) != "video":
             return jsonify({"error": "not a video"}), 400
-        target = body.get("target", "hevc")   # "hevc" (keep res) | "1080p"
+        # "1080p" (shrink to H.264) | "hevc" (keep res, for the hardware decoder)
+        target = body.get("target", "1080p")
+        if target == "hevc" and not config.HW_HEVC_DECODE:
+            # The UI hides this, so we only get here from a stale page or a
+            # hand-rolled request. Refuse rather than burn hours re-encoding onto
+            # a decoder that is switched off.
+            return jsonify({"error": "hardware HEVC decode is disabled; "
+                                     "transcoding to HEVC would gain nothing"}), 400
         info = media.probe(rel)
         transcode.start(rel, target, info.get("width") or 0,
                         info.get("height") or 0, info.get("duration") or 0,

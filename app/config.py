@@ -16,6 +16,16 @@ for d in (DATA_DIR, MEDIA_DIR, THUMB_DIR, PREVIEW_DIR):
 
 _lock = threading.RLock()
 
+# Is the Pi 5's hardware HEVC decoder (`rpi-hevc-dec`) in play?
+#
+# It is not: it green-screens on some streams (see docs/playback-on-pi5.md), so
+# app/gst.py demotes the GStreamer element to rank 0 and everything decodes in
+# software. This single flag is what the rest of the app keys off — the playback
+# badges, the auto-transcode policy and the "→ HEVC" button all only make sense
+# when HEVC actually buys you a hardware decoder. Flip it to True (and restart)
+# to put the decoder and all of that back, e.g. on a kernel where it's fixed.
+HW_HEVC_DECODE = False
+
 
 def new_id():
     return uuid.uuid4().hex[:12]
@@ -36,11 +46,12 @@ def _defaults():
             "stream_av_delay_ms": 0,       # manual extra delay for stream audio (ms)
             "stream_resync_interval_s": 3600,  # re-sync stream audio every N s (0=off)
             # Auto-transcode policy applied on upload (see app/transcode.py):
-            #   "off"   — never; play everything natively (4K HEVC in hardware,
-            #             H.264 in software). Default — the Pi 5 plays 4K.
-            #   "hevc"  — auto-convert >1080p non-HEVC uploads to HEVC (keep the
-            #             resolution) so they hardware-decode smoothly.
+            #   "off"   — never; keep and play the original. Default.
             #   "1080p" — auto-shrink anything over 1080p to 1080p H.264.
+            #   "hevc"  — auto-convert >1080p non-HEVC uploads to HEVC (keep the
+            #             resolution) so they hardware-decode smoothly. Only
+            #             meaningful when HW_HEVC_DECODE is on; while it is off
+            #             this policy is ignored and hidden from Settings.
             "transcode_policy": "off",
         },
         "playlists": [],

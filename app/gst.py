@@ -6,12 +6,16 @@ hardware plane (the vc4 HVS) — a zero-copy scanout that holds for 4K.
 
 On the Pi 5 the decode path depends on the codec (see app/transcode.py):
 
-  * HEVC / H.265 -> the dedicated hardware decoder (`rpi-hevc-dec`), smooth up
-    to 4Kp60 with the CPU near idle. playbin3 auto-plugs it and kmssink puts the
-    decoded frames straight onto a hardware plane (no CPU videoconvert).
+  * HEVC / H.265 -> the Pi 5 has a dedicated hardware decoder (`rpi-hevc-dec`),
+    but it miscodes some streams into a green screen, so we deliberately demote
+    it below and let HEVC decode in **software** too. See the GST_PLUGIN_FEATURE_RANK
+    comment further down for the failure mode and how to put it back.
   * H.264 and everything else -> **software** decode on the Cortex-A76 cores
     (the Pi 5 dropped the Pi 4's hardware H.264 block). Comfortable at 1080p;
-    heavy at 4K — which is why the UI offers transcoding to HEVC.
+    heavy at 4K.
+
+With the hardware decoder out of the picture every codec is software-decoded,
+so 1080p is the comfortable ceiling for all of them.
 
   * Video + audio: playbin3 with video-sink=kmssink. playbin gives us native
     volume, seeking (used for in/out trim), position/duration queries and EOS.
@@ -33,6 +37,24 @@ gi.require_version("Gst", "1.0")
 from gi.repository import Gst, GLib  # noqa: E402
 
 from . import config, media, nrk  # noqa: E402
+
+# Keep HEVC off the hardware decoder unless config says otherwise.
+# `rpi-hevc-dec` fails on some streams: once its coefficient buffer is grown
+# ("phase1_thread: Coeff realloc (600000) OK" in dmesg) every subsequent frame
+# errors out with "phase1_cb: Post wait: 0xffffffff", once per frame. The decoder
+# then emits nothing, kmssink scans out an untouched NV12 buffer, and the HDMI
+# output is solid green — silently, since the pipeline reports no error and the
+# live snapshot decodes from the source file rather than the plane. Demoting the
+# element to rank 0 makes playbin3 auto-plug the software decoder (avdec_h265)
+# instead: measured at ~2.5x realtime for 1080p on the A76 cores, so 1080p25/30
+# has ample headroom. 4K HEVC will not keep up this way.
+#
+# config.HW_HEVC_DECODE is the single switch (the badges and the "→ HEVC"
+# transcode option follow it too). setdefault leaves an explicit
+# GST_PLUGIN_FEATURE_RANK from the environment alone, so you can also override
+# just the decoder for one run without touching the flag.
+if not config.HW_HEVC_DECODE:
+    os.environ.setdefault("GST_PLUGIN_FEATURE_RANK", "v4l2slh265dec:0")
 
 Gst.init(None)
 

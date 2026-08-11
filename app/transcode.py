@@ -9,13 +9,17 @@ transcode here is software (libx265 / libx264) — correct but slow.
 
 So on the Pi 5 transcoding is an *option*, not a requirement. Two targets:
 
+  * ``1080p`` — re-encode to H.264 scaled to fit 1920x1080 (the legacy Pi-3
+                behaviour): smaller/lower-bandwidth files that software-decode
+                comfortably. **The useful target here.**
   * ``hevc``  — re-encode to HEVC at the **original resolution** (keep 4K),
                 so playback moves onto the hardware HEVC decoder. Encode is slow
                 (libx265 software), but you encode once and play smoothly many
-                times. This is the headline Pi-5 option.
-  * ``1080p`` — re-encode to H.264 scaled to fit 1920x1080 (the legacy Pi-3
-                behaviour): smaller/lower-bandwidth files that software-decode
-                comfortably.
+                times. Gated behind ``config.HW_HEVC_DECODE``: that decoder is
+                disabled by default (it green-screens — see
+                docs/playback-on-pi5.md), and while it is off this target only
+                burns hours to land the file on a decoder nothing will use. The
+                machinery stays here for whenever the decoder is usable again.
 
 A transcode is started either manually (a button per file in the web UI) or
 automatically on upload, depending on the ``transcode_policy`` setting.
@@ -24,7 +28,7 @@ import os
 import subprocess
 import threading
 
-from . import media
+from . import config, media
 
 # "1080p" downscale target, and the 4K ceiling of the hardware HEVC decoder.
 MAX_W, MAX_H = 1920, 1080
@@ -95,10 +99,15 @@ def playback_mode(width, height, codec):
       'hw'    — hardware-decoded (HEVC, up to 4K): smooth, CPU near idle.
       'sw'    — software-decoded at <=1080p: comfortable on the A76 cores.
       'heavy' — software-decoded above 1080p (e.g. 4K H.264 / VP9 / AV1): the
-                CPU may not keep up; transcoding to HEVC is offered as an option.
+                CPU may not keep up; shrinking to 1080p is offered as an option.
+
+    'hw' only ever applies while ``config.HW_HEVC_DECODE`` is on. With the
+    hardware decoder disabled (the default — it green-screens, see
+    docs/playback-on-pi5.md) every codec is software-decoded, so the rule is
+    simply resolution: <=1080p is fine, above it is heavy, HEVC included.
     """
     c = (codec or "").lower()
-    if c in HW_DECODE_CODECS:
+    if config.HW_HEVC_DECODE and c in HW_DECODE_CODECS:
         return "hw"
     over_1080 = bool(width and height and (width > MAX_W or height > MAX_H))
     return "heavy" if over_1080 else "sw"
@@ -112,13 +121,17 @@ def auto_target(width, height, codec, policy):
       policy 'hevc'  -> convert anything that would software-decode at >1080p
                         ('heavy') to HEVC at its original resolution, so it
                         hardware-decodes. Leaves HEVC and <=1080p files alone.
+                        Ignored unless ``config.HW_HEVC_DECODE`` is on: with the
+                        hardware decoder disabled this would re-encode files onto
+                        a decoder that is never used, costing hours and gaining
+                        nothing.
       policy '1080p' -> convert anything larger than 1080p down to 1080p H.264
                         (the legacy Pi-3 behaviour).
     """
     over_1080 = bool(width and height and (width > MAX_W or height > MAX_H))
     if policy == "1080p":
         return "1080p" if over_1080 else None
-    if policy == "hevc":
+    if policy == "hevc" and config.HW_HEVC_DECODE:
         return "hevc" if playback_mode(width, height, codec) == "heavy" else None
     return None
 

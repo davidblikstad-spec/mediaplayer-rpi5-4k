@@ -6,10 +6,12 @@ the Pi 3 / 1080p build.
 
 ## TL;DR
 
-- The Pi 5 outputs **4K** (dual 4Kp60 HDMI) and decodes **HEVC/H.265 in
-  hardware** (the `rpi-hevc-dec` V4L2 block) — smooth native **4Kp60** with the
-  CPU near idle. The player uses GStreamer: `… ! v4l2sl*dec ! kmssink`,
-  auto-plugged via `playbin3`, scanned out zero-copy onto a DRM hardware plane.
+- The Pi 5 outputs **4K** (dual 4Kp60 HDMI) and has a **hardware HEVC/H.265
+  decoder** (the `rpi-hevc-dec` V4L2 block) — but we **deliberately don't use
+  it**: it miscodes some streams into a green screen (see *Hardware HEVC decode
+  is disabled* below). `app/gst.py` demotes it to rank 0, so **every codec is
+  software-decoded** and **1080p is the comfortable ceiling** for all of them.
+  The player uses GStreamer `playbin3 ! kmssink`, scanned out onto a DRM plane.
 - The Pi 5 has **no hardware H.264 decoder** (the Pi 4's `bcm2835-codec` block
   was dropped). H.264 and other codecs are **software-decoded** on the
   Cortex-A76 cores: comfortable at 1080p, heavy at 4K.
@@ -31,9 +33,13 @@ There is **no** H.264/H.265 *encoder* node and **no** H.264 *decoder* node. So:
 
 | Codec        | ≤1080p           | 4K (2160p)                       |
 |--------------|------------------|----------------------------------|
-| HEVC / H.265 | hardware (idle)  | **hardware** (idle) — the sweet spot |
+| HEVC / H.265 | software (fine)  | software (**heavy**) — hardware decoder disabled, see below |
 | H.264        | software (fine)  | software (**heavy**, may stutter) |
 | VP9 / AV1 /… | software (fine)  | software (heavy)                 |
+
+> `app/transcode.py:playback_mode()` still reports HEVC as `hw`, so the Media
+> Library badges overstate HEVC files. With the hardware decoder disabled the
+> honest rule is simply **≤1080p = fine, >1080p = heavy**, whatever the codec.
 
 `app/transcode.py:playback_mode()` returns `hw` / `sw` / `heavy` from these
 rules, and the Media Library badges each file accordingly.
@@ -82,6 +88,54 @@ decoder, prints which one (hardware `v4l2sl*dec` for HEVC vs software
 display, and dumps the plugged elements (confirming hardware HEVC + no
 `videoconvert` for H.265 files). Both stop the mediaplayer service to free DRM
 master and restore it on exit.
+
+## Hardware HEVC decode is disabled (green screen)
+
+`rpi-hevc-dec` fails on some HEVC streams. Once the driver grows its coefficient
+buffer:
+
+```
+rpi-hevc-dec 1000800000.codec: phase1_thread: Coeff realloc (600000) OK
+```
+
+every frame from then on errors out, once per frame (25/s on a 25 fps file):
+
+```
+rpi-hevc-dec 1000800000.codec: phase1_cb: Post wait: 0xffffffff
+```
+
+The decoder emits nothing, kmssink scans out an untouched NV12 buffer, and the
+HDMI output goes **solid green** (all-zero NV12 renders green). It fails
+silently: the pipeline reports no error, and the live snapshot still looks
+correct because it decodes from the *source file*, not from the plane. The files
+themselves are fine — they software-decode without a single error.
+
+So `config.HW_HEVC_DECODE = False` (in `app/config.py`), which makes `app/gst.py`
+set `GST_PLUGIN_FEATURE_RANK=v4l2slh265dec:0` before `Gst.init()` so `playbin3`
+auto-plugs `avdec_h265` instead. Software HEVC decode measures **~2.5x realtime
+at 1080p** on the four A76 cores — ample for 1080p25/30, not enough for 4K.
+
+That one flag is what the rest of the app keys off, so everything downstream
+stays consistent with it:
+
+| | `HW_HEVC_DECODE = False` (default) | `= True` |
+|---|---|---|
+| HEVC decode | software (`avdec_h265`) | hardware (`v4l2slh265dec`) |
+| Media Library badge | by resolution only — `≤1080p` / `>1080p may stutter` | HEVC badged `hardware 4K` |
+| **→ HEVC** button | hidden; `/api/transcode/start` refuses the target | shown |
+| Auto-transcode *To HEVC* | hidden in Settings, ignored by `auto_target()` | available |
+
+To re-enable the hardware decoder (e.g. on a kernel where it's fixed), flip
+`HW_HEVC_DECODE` to `True` and restart. For a one-off test without touching the
+flag, set the env var — `os.environ.setdefault` leaves an explicit value alone:
+
+```bash
+GST_PLUGIN_FEATURE_RANK=v4l2slh265dec:300 ./venv/bin/python run.py
+```
+
+Watch `dmesg -w | grep hevc` while it plays: a per-frame `Post wait: 0xffffffff`
+flood means that stream still hits the bug (and it will spam the kernel ring
+buffer clean in about a minute).
 
 ## Known limitations / follow-ups
 

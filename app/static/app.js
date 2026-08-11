@@ -325,7 +325,9 @@ $("#sch-new").onclick = async () => {
 
 /* ---------- MEDIA ---------- */
 // On the Pi 5 every file plays — these only describe *how*, and which
-// transcode (if any) is worth offering.
+// transcode (if any) is worth offering. "hw" is only ever sent while the
+// hardware HEVC decoder is enabled (cfg.hw_hevc_decode); with it off every
+// codec is software-decoded and the badge is purely about resolution.
 const PLAY_MODE = {
   hw:    { cls: "ok",   text: "HEVC · hardware 4K" },
   sw:    { cls: "ok",   text: "software ≤1080p" },
@@ -355,10 +357,13 @@ function renderMediaGrid() {
     if (transcoding) {
       actions += `<button class="small danger abort">Abort</button>`;
     } else if (m.type === "video") {
-      // Transcode is always optional. Offer "→ HEVC" (gain hardware decode,
-      // keep resolution) for anything not already HEVC, and "→ 1080p" to shrink.
-      if (mode !== "hw") actions += `<button class="small primary tc" data-target="hevc">→ HEVC</button>`;
-      actions += `<button class="small tc" data-target="1080p">→ 1080p</button>`;
+      // Transcode is always optional. "→ HEVC" (keep resolution, gain hardware
+      // decode) is only worth offering when that decoder is actually enabled —
+      // otherwise it is hours of software encoding for nothing, so hide it and
+      // lead with "→ 1080p", which is the useful target either way.
+      const hevcWorthIt = cfg.hw_hevc_decode && mode !== "hw";
+      if (hevcWorthIt) actions += `<button class="small tc" data-target="hevc">→ HEVC</button>`;
+      actions += `<button class="small ${hevcWorthIt ? "" : "primary "}tc" data-target="1080p">→ 1080p</button>`;
     }
     actions += `<button class="small danger del">Delete</button>`;
     c.innerHTML = `
@@ -520,7 +525,15 @@ function renderSettings() {
   $("#set-avdelay").value = s.stream_av_delay_ms ?? 0;
   $("#set-resync").value = Math.round((s.stream_resync_interval_s ?? 3600) / 60);
   $("#set-ao").value = (s.audio_out || "auto").replace(/^alsa\//, "");
-  $("#set-tc-policy").value = s.transcode_policy || "off";
+  // The "To HEVC" policy only pays off via the hardware decoder; drop it from
+  // the menu while that is disabled (and fall back to "Off" if it was the
+  // saved value, so the select doesn't show a blank).
+  const tcPolicy = $("#set-tc-policy");
+  const hevcOpt = tcPolicy.querySelector('option[value="hevc"]');
+  if (hevcOpt) hevcOpt.hidden = !cfg.hw_hevc_decode;
+  let policy = s.transcode_policy || "off";
+  if (policy === "hevc" && !cfg.hw_hevc_decode) policy = "off";
+  tcPolicy.value = policy;
   $("#pw-user").value = (cfg.auth && cfg.auth.username) || "";
   if (s.default_item) $("#set-default-dur").value = s.default_item.duration || 10;
 }

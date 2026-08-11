@@ -2,8 +2,14 @@
 
 A self-hosted video/image player for the Pi's HDMI output, configured from a
 web interface. Built for the **Raspberry Pi 5 / Debian 13**, console (no
-desktop), playing directly to DRM/KMS via **GStreamer** — **native 4K** with
-**hardware HEVC decode** and **optional transcoding**.
+desktop), playing directly to DRM/KMS via **GStreamer**, with **optional
+transcoding**.
+
+> **Note:** the Pi 5's hardware HEVC decoder is **disabled** in this build
+> (`config.HW_HEVC_DECODE = False`) — it miscodes some streams into a green
+> screen. Everything is software-decoded, so **1080p is the practical ceiling**.
+> See [*Hardware HEVC decode is disabled*](docs/playback-on-pi5.md) for the
+> detail and how to turn it back on.
 
 > This is the Pi 5 / 4K adaptation of
 > [`mediaplayer-rpi3-1080p`](https://github.com/davidblikstad-spec/mediaplayer-rpi3-1080p).
@@ -13,15 +19,17 @@ desktop), playing directly to DRM/KMS via **GStreamer** — **native 4K** with
 
 ## What's different from the Pi 3 build
 
-- **4K playback.** HEVC/H.265 is decoded in **hardware** (`rpi-hevc-dec`), smooth
-  to 4Kp60 with the CPU near idle. H.264 and other codecs are **software**-decoded
-  on the Cortex-A76 cores (fine at 1080p, heavy at 4K).
-- **Transcoding is optional and policy-driven**, not automatic. The new headline
-  option re-encodes to **HEVC at the original resolution** so 4K H.264 footage
-  moves onto the hardware decoder. (The Pi 5 has no hardware *encoder*, so the
-  encode is software — slow but one-time.)
-- Per-file **playability badges** in the Media Library (`hardware 4K` /
-  `software ≤1080p` / `software >1080p — may stutter`).
+- **Decoding is all software** on the Cortex-A76 cores — fine at 1080p, heavy at
+  4K. The Pi 5's hardware HEVC block would have made 4K HEVC cheap, but it's
+  disabled here (green-screen bug, see above), and the Pi 5 never had a hardware
+  H.264 decoder at all.
+- **Transcoding is optional and policy-driven**, not automatic. With the
+  hardware decoder disabled, the useful target is **→ 1080p** (H.264, fits the
+  software decoder comfortably). The **→ HEVC** target was built to move 4K
+  H.264 onto the hardware decoder and buys nothing while that decoder is off.
+- Per-file **playability badges** in the Media Library — note these still assume
+  hardware HEVC and so overstate HEVC files; the honest rule is **≤1080p = fine,
+  >1080p = heavy**, whatever the codec.
 
 See [`docs/playback-on-pi5.md`](docs/playback-on-pi5.md) for the hardware detail.
 
@@ -29,10 +37,10 @@ See [`docs/playback-on-pi5.md`](docs/playback-on-pi5.md) for the hardware detail
 
 - **Web UI with login** (username + password, stored hashed; session cookie).
 - **Fullscreen HDMI playback** of videos and images via GStreamer on DRM/KMS,
-  zero-copy onto a hardware plane — **native 4K** for HEVC.
-- **Transcoding (optional):** per-file **→ HEVC** (keep resolution, gain hardware
-  decode) or **→ 1080p** (shrink to H.264), plus an auto-on-upload policy. Runs
-  in the background with a progress bar.
+  scanned out onto a hardware plane.
+- **Transcoding (optional):** per-file **→ 1080p** (shrink to H.264) or
+  **→ HEVC** (keep resolution — only useful with the hardware decoder enabled),
+  plus an auto-on-upload policy. Runs in the background with a progress bar.
 - **Live TV channels** (NRK1/2/3/Super) as playlist items — resolved fresh from
   NRK's public psapi at play time; optional play-duration before advancing.
 - **Playlists** of video + image items, with per-item:
@@ -84,16 +92,16 @@ console (or via the systemd service).
 
 - Upload your media in the **Media Library**. Each file is badged with how it
   will play on the Pi 5.
-- A **4K HEVC** file just plays (hardware) — nothing to do.
-- A **4K H.264** file is badged *"software >1080p — may stutter"*. Click
-  **→ HEVC** to re-encode it (keeping 4K) onto the hardware decoder, or **→
-  1080p** to shrink it. Either runs in the background.
+- Anything **over 1080p** is software-decoded above the comfortable ceiling and
+  may stutter, whatever the codec. Click **→ 1080p** to shrink it to H.264; it
+  runs in the background.
 - To do this automatically on upload, set **Settings → Transcoding → Auto-transcode
-  on upload** to *To HEVC* or *To 1080p* (default is *Off* — keep originals).
+  on upload** to *To 1080p* (default is *Off* — keep originals).
+- **→ HEVC** keeps the original resolution and only paid off via the hardware
+  decoder, so leave it alone while that decoder is disabled.
 
-> Software HEVC encoding of 4K is slow on the Pi (well below realtime). It's a
-> one-time cost; afterwards playback is hardware-decoded and smooth. For bulk
-> jobs, transcode on a faster machine and upload the result.
+> For bulk work, transcode on a faster machine and upload the result — the Pi 5
+> has no hardware *encoder*, so every transcode here is software and slow.
 
 ## Usage notes
 
