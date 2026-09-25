@@ -14,7 +14,7 @@ for _v in ("TMPDIR", "TEMP", "TMP"):
 tempfile.tempdir = _TMP
 
 from app import create_app
-from app import config
+from app import applog, config
 
 app = create_app()
 
@@ -22,10 +22,13 @@ if __name__ == "__main__":
     cfg = config.load()
     host = cfg["settings"].get("host", "0.0.0.0")
     port = int(cfg["settings"].get("port", 8080))
+    # Same log as the rest of the app: this banner used to print to a stdout
+    # that goes nowhere under systemd (see app/applog.py).
+    log = applog.make_log()
     try:
         from waitress import serve
-        print("[mediaplayer] serving on http://%s:%d (waitress)" % (host, port), flush=True)
+        log("serving on http://%s:%d (waitress)" % (host, port))
         serve(app, host=host, port=port, threads=8)
     except ImportError:
-        print("[mediaplayer] serving on http://%s:%d (flask dev server)" % (host, port), flush=True)
+        log("serving on http://%s:%d (flask dev server)" % (host, port))
         app.run(host=host, port=port, threaded=True)

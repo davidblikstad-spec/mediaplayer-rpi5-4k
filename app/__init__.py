@@ -10,7 +10,7 @@ from flask import (Flask, jsonify, redirect, request, send_file,
 from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.utils import secure_filename
 
-from . import cec, config, media, transcode, nrk, gst as gstmod
+from . import applog, cec, config, media, transcode, nrk, gst as gstmod
 from .scheduler import Scheduler
 
 _snap_last = {"t": 0.0}
@@ -72,7 +72,9 @@ def create_app():
     app.jinja_env.auto_reload = True
 
     # ---- player + scheduler singletons -----------------------------------
-    log = lambda m: print("[mediaplayer]", m, flush=True)
+    # Logs to data/mediaplayer.log as well as stdout — the service's stdout
+    # doesn't reach the journal (see app/applog.py).
+    log = applog.make_log()
     gstmod.player = gstmod.GstPlayer(log=log)
     gstmod.player.start()
     gstmod.engine = gstmod.PlayerEngine(gstmod.player, log=log)

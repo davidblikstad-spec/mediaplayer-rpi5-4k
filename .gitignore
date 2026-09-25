@@ -9,6 +9,9 @@ __pycache__/
 data/config.json
 data/*.tmp
 
+# Application log and its rotations (see app/applog.py)
+data/mediaplayer.log*
+
 # Disk-backed temp dir for large uploads (see run.py)
 data/tmp/
 
