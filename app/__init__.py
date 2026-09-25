@@ -76,6 +76,7 @@ def create_app():
     gstmod.player = gstmod.GstPlayer(log=log)
     gstmod.player.start()
     gstmod.engine = gstmod.PlayerEngine(gstmod.player, log=log)
+    gstmod.engine.start_watchdog()
     app.scheduler = Scheduler(gstmod.engine, log=log)
     app.scheduler.reload()
 

@@ -27,6 +27,7 @@ Only one pipeline holds the DRM plane at a time; the other is forced to NULL
 surfaced to listeners as {"event": "end-file", "reason": "eof"}, the contract
 PlayerEngine consumes, so the playlist/loop/fade engine is codec-agnostic.
 """
+import glob
 import os
 import subprocess
 import threading
@@ -74,6 +75,17 @@ STREAM_AV_DELAY_MS = 0
 # stream_resync_interval_s. Each cycle costs a tiny audio hiccup as the sink
 # re-engages the clock — negligible once an hour.
 STREAM_RESYNC_INTERVAL_S = 3600
+# How long a load() will wait for the HDMI connector to be enabled before
+# opening the audio device anyway (see GstPlayer._wait_for_hdmi). Only ever
+# spent on a cold boot where the TV handshakes after we're already running.
+HDMI_READY_TIMEOUT_S = 15.0
+# Playback watchdog (see PlayerEngine._watchdog): how often to sample the
+# playback position, and how long it may sit still on a supposedly-playing item
+# before we treat the pipeline as wedged and rebuild it.
+STALL_CHECK_S = 5.0
+STALL_GRACE_S = 20.0
+# Ceiling on the watchdog's exponential backoff between failed rebuilds.
+STALL_BACKOFF_MAX_S = 300.0
 
 
 class GstPlayer:
@@ -162,6 +174,21 @@ class GstPlayer:
             return None
         if self._audio_device:
             sink.set_property("device", self._audio_device)
+        # Don't let the audio sink be the pipeline clock. By default alsasink
+        # provides it, which means a dead HDMI audio device takes video down
+        # with it: if the card never starts, that clock never ticks, kmssink
+        # waits forever for the running-time of frame two, and the screen holds
+        # frame one indefinitely with no error on the bus. That is exactly what
+        # the vc4 HDMI audio path does when `vc4_hdmi_audio_prepare` loses its
+        # race with the display coming up ("Packet RAM has to be on to store the
+        # packet" in dmesg, then `snd_soc_pcm_dai_prepare ... -22`): ALSA sits in
+        # PREPARED with hw_ptr pinned at 0 forever.
+        #
+        # On the system clock instead, audiobasesink slaves its ringbuffer to
+        # the pipeline (default slave-method=skew, which also absorbs the
+        # long-run drift between the ALSA hardware clock and the system clock),
+        # and silent-but-playing beats frozen for a signage screen.
+        sink.set_property("provide-clock", False)
         q = Gst.ElementFactory.make("queue", None)
         q.set_property("max-size-time", 10 * Gst.SECOND)
         q.set_property("max-size-bytes", 0)
@@ -237,10 +264,45 @@ class GstPlayer:
 
     _TEXT_FLAG = 1 << 2                           # GST_PLAY_FLAG_TEXT
 
+    def _wait_for_hdmi(self, timeout=HDMI_READY_TIMEOUT_S):
+        """Block (briefly) until a DRM HDMI connector is connected and enabled.
+
+        The vc4 driver only turns the HDMI packet RAM on once the encoder is
+        enabled with a mode, and `vc4_hdmi_audio_prepare` hard-fails with -22 if
+        it writes the audio infoframe before that. Opening audio in that window
+        wedges the card (see the provide-clock note in _make_audio_sink), so on
+        a cold boot where the TV handshakes late we wait for the display rather
+        than race it. Returns immediately in the normal case — the connector is
+        already up — and gives up after `timeout` so a genuinely headless or
+        powered-off screen still plays (to nowhere) instead of blocking."""
+        deadline = time.monotonic() + timeout
+        waited = False
+        while True:
+            try:
+                for conn in glob.glob("/sys/class/drm/*-HDMI-A-*"):
+                    with open(os.path.join(conn, "status")) as f:
+                        if f.read().strip() != "connected":
+                            continue
+                    with open(os.path.join(conn, "enabled")) as f:
+                        if f.read().strip() == "enabled":
+                            if waited:
+                                self.log("HDMI ready (%s)" % os.path.basename(conn))
+                            return True
+            except OSError:
+                return True          # no sysfs to consult; don't stand in the way
+            if time.monotonic() >= deadline:
+                self.log("HDMI not enabled after %gs; starting anyway" % timeout)
+                return False
+            if not waited:
+                self.log("waiting for HDMI to come up before opening audio")
+                waited = True
+            time.sleep(0.2)
+
     def _play_video(self, src, start, end, is_url=False, subtitles=False):
         pb = self.playbin
         if pb is None:
             return
+        self._wait_for_hdmi()
         if is_url:                                # subtitles on/off for streams
             flags = pb.get_property("flags")
             flags = (flags | self._TEXT_FLAG) if subtitles else (flags & ~self._TEXT_FLAG)
@@ -671,6 +733,67 @@ class PlayerEngine:
                 self._load_current()
             else:
                 self.play_default()
+
+    def start_watchdog(self):
+        """Watch for a wedged pipeline and rebuild it.
+
+        GstPlayer.restart() has always existed for "a wedged sink", but nothing
+        called it, so a pipeline that stopped advancing without posting an error
+        stayed stuck until someone noticed the screen. The failure this was
+        written for is HDMI audio failing to start (see _make_audio_sink): the
+        bus stays silent, so the only observable symptom is that the playback
+        position stops moving while we still believe we're playing.
+
+        Sampling the position covers that class of stall generally, whatever the
+        cause, and the recovery is the same pair the audio-device switch in
+        /api/settings already uses: rebuild the pipeline, then reload the item."""
+        t = threading.Thread(target=self._watchdog, daemon=True)
+        t.start()
+
+    def _watchdog(self):
+        last_pos = None
+        stuck_for = 0.0
+        strikes = 0          # consecutive rebuilds that didn't get us playing
+        while True:
+            time.sleep(STALL_CHECK_S)
+            try:
+                # get_time_pos() is None for images (which legitimately hold a
+                # frame) and when nothing is loaded, so both fall out here.
+                pos = (None if self.player.get_pause()
+                       else self.player.get_time_pos())
+                if pos is None:
+                    last_pos, stuck_for = None, 0.0
+                    continue
+                if last_pos is None:
+                    # First sample (including the one right after a rebuild):
+                    # nothing to compare against yet. Deliberately does not
+                    # clear `strikes` — only observed progress does, or a failed
+                    # rebuild would reset its own backoff on the very next tick.
+                    stuck_for = 0.0
+                elif abs(pos - last_pos) < 0.05:
+                    stuck_for += STALL_CHECK_S
+                else:
+                    stuck_for = 0.0
+                    strikes = 0          # real progress: we're recovered
+                last_pos = pos
+                # Back off exponentially while rebuilds aren't taking. If the
+                # wedge is in the driver rather than our pipeline, retrying
+                # every 20s just churns the kmssink/DRM plane all day, which
+                # _play_image notes can itself wedge HDMI — so wait longer each
+                # time, up to STALL_BACKOFF_MAX_S, instead of hammering it.
+                grace = min(STALL_GRACE_S * (2 ** strikes), STALL_BACKOFF_MAX_S)
+                if stuck_for < grace:
+                    continue
+                strikes += 1
+                self.log("watchdog: position stuck at %.2fs for %gs — "
+                         "rebuilding the pipeline (attempt %d)"
+                         % (pos, stuck_for, strikes))
+                last_pos, stuck_for = None, 0.0
+                self.player.restart()
+                self.reapply()
+            except Exception as e:  # noqa - a watchdog must never die
+                self.log("watchdog error: %s" % e)
+                last_pos, stuck_for = None, 0.0
 
     def play_default(self):
         with self.lock:
