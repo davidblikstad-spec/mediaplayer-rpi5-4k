@@ -98,6 +98,7 @@ class GstPlayer:
         self.playbin = None               # reused playbin3 for video/audio
         self.imgpipe = None               # per-image pipeline
         self._img_shown_path = None       # file on the live image pipeline
+        self._vid_loaded = None           # (path, start, end) on the live playbin
         self._active_bus = None           # bus the watcher polls
         self._gen = 0                     # cancels stale image timers
         self._img_timer = None
@@ -260,7 +261,8 @@ class GstPlayer:
                     self._arm_image_timer(hold)
             else:
                 self._stop_image()
-                self._play_video(src, self._cur_start, end)
+                if not self._replay_video(src, self._cur_start, end):
+                    self._play_video(src, self._cur_start, end)
 
     _TEXT_FLAG = 1 << 2                           # GST_PLAY_FLAG_TEXT
 
@@ -317,6 +319,7 @@ class GstPlayer:
         if self._adelay is not None:
             self._adelay.set_property(
                 "min-threshold-time", self._av_delay_ms * Gst.MSECOND if is_url else 0)
+        self._vid_loaded = None
         pb.set_state(Gst.State.READY)            # flush any previous stream
         pb.set_property("uri", src if is_url else Gst.filename_to_uri(src))
         pb.set_state(Gst.State.PAUSED)
@@ -333,6 +336,29 @@ class GstPlayer:
         if is_url:
             self._arm_sync_flip()
             self._arm_periodic_resync()
+        else:
+            self._vid_loaded = (src, start, end)
+
+    def _replay_video(self, src, start, end):
+        """Loop the file that is already on the playbin by seeking back to its
+        start instead of reloading it. _play_video drops the playbin to READY,
+        which makes kmssink release the DRM plane — a black flash on every loop
+        of the same video. A flushing seek keeps the pipeline (and the last
+        frame on screen) alive until the first frame of the next pass arrives.
+        Returns False if there is nothing to reuse, so load() does a full load."""
+        pb = self.playbin
+        if pb is None or self._vid_loaded != (src, start, end):
+            return False
+        flags = Gst.SeekFlags.FLUSH | Gst.SeekFlags.ACCURATE
+        stop_type = Gst.SeekType.SET if end is not None else Gst.SeekType.NONE
+        stop_ns = int(float(end) * Gst.SECOND) if end is not None else -1
+        if not pb.seek(1.0, Gst.Format.TIME, flags,
+                       Gst.SeekType.SET, int(start * Gst.SECOND), stop_type, stop_ns):
+            self.log("loop seek failed; reloading %s" % os.path.basename(src))
+            return False
+        pb.set_property("volume", self._volume / 100.0)
+        pb.set_state(Gst.State.PLAYING)          # in case it was paused
+        return True
 
     def _arm_sync_flip(self):
         """After a short synced hold, flip the audio sink to free-float so a live
@@ -442,6 +468,7 @@ class GstPlayer:
             self._resync_timer = None
 
     def _stop_video(self):
+        self._vid_loaded = None
         if self.playbin is not None:
             self.playbin.set_state(Gst.State.NULL)
 
@@ -683,6 +710,7 @@ class GstPlayer:
             elif msg.type == Gst.MessageType.ERROR:
                 err, dbg = msg.parse_error()
                 self.log("gst error: %s (%s)" % (err, dbg))
+                self._vid_loaded = None      # broken pipeline: reload, don't seek
                 self._emit({"event": "end-file", "reason": "error"})
 
     def _emit(self, ev):
