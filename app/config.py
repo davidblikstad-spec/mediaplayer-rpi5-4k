@@ -53,6 +53,16 @@ def _defaults():
             #             meaningful when HW_HEVC_DECODE is on; while it is off
             #             this policy is ignored and hidden from Settings.
             "transcode_policy": "off",
+            # Gapless / cross-fading playback (app/mixer.py): one output
+            # pipeline that never stops, so there is no black between items and
+            # playlists can fade between them. Set to false to go back to the
+            # original player (a pipeline per item, black in between).
+            "gapless": True,
+            # Size of the output canvas for the gapless player: "auto" = the
+            # TV's native mode (e.g. 3840x2160), or e.g. "1920x1080". Smaller =
+            # less CPU (the TV scales it up); everything is scaled to it.
+            "output_resolution": "auto",
+            "output_fps": 30,              # canvas frame rate (25, 30, 50, 60)
         },
         "playlists": [],
         "schedules": [],

@@ -88,6 +88,41 @@ STALL_GRACE_S = 20.0
 STALL_BACKOFF_MAX_S = 300.0
 
 
+def wait_for_hdmi(log, timeout=HDMI_READY_TIMEOUT_S):
+    """Block (briefly) until a DRM HDMI connector is connected and enabled.
+
+    The vc4 driver only turns the HDMI packet RAM on once the encoder is
+    enabled with a mode, and `vc4_hdmi_audio_prepare` hard-fails with -22 if
+    it writes the audio infoframe before that. Opening audio in that window
+    wedges the card (see the provide-clock note in _make_audio_sink), so on
+    a cold boot where the TV handshakes late we wait for the display rather
+    than race it. Returns immediately in the normal case — the connector is
+    already up — and gives up after `timeout` so a genuinely headless or
+    powered-off screen still plays (to nowhere) instead of blocking."""
+    deadline = time.monotonic() + timeout
+    waited = False
+    while True:
+        try:
+            for conn in glob.glob("/sys/class/drm/*-HDMI-A-*"):
+                with open(os.path.join(conn, "status")) as f:
+                    if f.read().strip() != "connected":
+                        continue
+                with open(os.path.join(conn, "enabled")) as f:
+                    if f.read().strip() == "enabled":
+                        if waited:
+                            log("HDMI ready (%s)" % os.path.basename(conn))
+                        return True
+        except OSError:
+            return True          # no sysfs to consult; don't stand in the way
+        if time.monotonic() >= deadline:
+            log("HDMI not enabled after %gs; starting anyway" % timeout)
+            return False
+        if not waited:
+            log("waiting for HDMI to come up before opening audio")
+            waited = True
+        time.sleep(0.2)
+
+
 class GstPlayer:
     """Owns the GStreamer pipelines and exposes mpv-style playback primitives."""
 
@@ -267,38 +302,7 @@ class GstPlayer:
     _TEXT_FLAG = 1 << 2                           # GST_PLAY_FLAG_TEXT
 
     def _wait_for_hdmi(self, timeout=HDMI_READY_TIMEOUT_S):
-        """Block (briefly) until a DRM HDMI connector is connected and enabled.
-
-        The vc4 driver only turns the HDMI packet RAM on once the encoder is
-        enabled with a mode, and `vc4_hdmi_audio_prepare` hard-fails with -22 if
-        it writes the audio infoframe before that. Opening audio in that window
-        wedges the card (see the provide-clock note in _make_audio_sink), so on
-        a cold boot where the TV handshakes late we wait for the display rather
-        than race it. Returns immediately in the normal case — the connector is
-        already up — and gives up after `timeout` so a genuinely headless or
-        powered-off screen still plays (to nowhere) instead of blocking."""
-        deadline = time.monotonic() + timeout
-        waited = False
-        while True:
-            try:
-                for conn in glob.glob("/sys/class/drm/*-HDMI-A-*"):
-                    with open(os.path.join(conn, "status")) as f:
-                        if f.read().strip() != "connected":
-                            continue
-                    with open(os.path.join(conn, "enabled")) as f:
-                        if f.read().strip() == "enabled":
-                            if waited:
-                                self.log("HDMI ready (%s)" % os.path.basename(conn))
-                            return True
-            except OSError:
-                return True          # no sysfs to consult; don't stand in the way
-            if time.monotonic() >= deadline:
-                self.log("HDMI not enabled after %gs; starting anyway" % timeout)
-                return False
-            if not waited:
-                self.log("waiting for HDMI to come up before opening audio")
-                waited = True
-            time.sleep(0.2)
+        return wait_for_hdmi(self.log, timeout)
 
     def _play_video(self, src, start, end, is_url=False, subtitles=False):
         pb = self.playbin
@@ -478,8 +482,9 @@ class GstPlayer:
             self.imgpipe = None
         self._img_shown_path = None
 
-    def stop(self):
-        """Blank the screen and play nothing (releases the DRM plane)."""
+    def stop(self, graceful=False):
+        """Blank the screen and play nothing (releases the DRM plane).
+        `graceful` only matters to the gapless player."""
         with self._lock:
             self._cancel_image_timer()
             self._stop_video()
@@ -592,18 +597,25 @@ class GstPlayer:
         threading.Thread(target=run, daemon=True).start()
         return True
 
-    def _grab_from_pipeline(self, path):
-        """Tap playbin's last decoded frame and JPEG-encode it. Returns False
-        (so the caller can fall back) if there's no usable frame."""
+    def _last_sample(self):
+        """The frame currently on screen, as a Gst.Sample, or None."""
         pb = self.playbin
         if pb is None or self._cur_kind == "image":
-            return False
+            return None
         try:
-            sample = pb.get_property("sample")
+            return pb.get_property("sample")
         except Exception:
-            sample = None
+            return None
+
+    def _grab_from_pipeline(self, path):
+        """Tap the last decoded frame and JPEG-encode it. Returns False
+        (so the caller can fall back) if there's no usable frame."""
+        sample = self._last_sample()
         if sample is None:
             return False
+        return self._encode_sample(sample, path)
+
+    def _encode_sample(self, sample, path):
         st = sample.get_caps().get_structure(0)
         ok_w, w = st.get_int("width")
         ok_h, h = st.get_int("height")
@@ -735,6 +747,7 @@ class PlayerEngine:
         self.current = None       # the item dict now playing
         self.playlist_name = None
         self.playing_default = False
+        self.transition = 0.0     # cross-fade (s) between items of the playlist
         self._gen = 0             # generation counter to cancel stale timers
         player.event_handlers.append(self._on_event)
 
@@ -750,6 +763,7 @@ class PlayerEngine:
             self.items = items
             self.index = 0
             self.loop_playlist = bool(playlist.get("loop_playlist", True))
+            self.transition = self._transition_of(playlist)
             self.playlist_name = playlist.get("name")
             self.playing_default = False
             self._load_current()
@@ -823,7 +837,9 @@ class PlayerEngine:
                 self.log("watchdog error: %s" % e)
                 last_pos, stuck_for = None, 0.0
 
-    def play_default(self):
+    def play_default(self, graceful=False):
+        """Fall back to the default item (or a black screen). `graceful`: the
+        playlist ended on its own, as opposed to being stopped."""
         with self.lock:
             cfg = config.load()
             item = cfg["settings"].get("default_item")
@@ -833,12 +849,12 @@ class PlayerEngine:
             if not item:
                 self.playing_default = True
                 self._bump_gen()
-                self.player.stop()
+                self.player.stop(graceful=graceful)
                 return
             ritem = self._resolve(item)
             if not ritem:
                 self.playing_default = True
-                self.player.stop()
+                self.player.stop(graceful=graceful)
                 return
             self.playing_default = True
             self._play_item(ritem)
@@ -917,7 +933,7 @@ class PlayerEngine:
             if self.loop_playlist:
                 self.index = 0
             else:
-                self.play_default()
+                self.play_default(graceful=True)
                 return
         item = self.items[self.index]
         loop = item.get("loop", 1)
@@ -928,16 +944,47 @@ class PlayerEngine:
             self.loops_left = max(1, int(loop))
         self._play_item(item)
 
+    @staticmethod
+    def _transition_of(playlist):
+        try:
+            return max(0.0, min(5.0, float(playlist.get("transition_s") or 0)))
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _item_args(self, item):
+        """(load kwargs, play length in s or None) for a file/image item."""
+        t = item["_type"]
+        vol = int(item.get("volume", 100)) if t != "image" else 100
+        fade_in = float(item.get("fade_in") or 0) if t != "image" else 0
+        if t == "image":
+            dur = float(item.get("duration") or 10)
+            return dict(src=item["_abs"], kind="image", hold=dur), dur
+        tin = float(item.get("in") or 0)
+        tout = item.get("out")
+        end = None
+        eff_len = None
+        if tout not in (None, "", 0):
+            end = float(tout)
+            eff_len = end - tin
+        elif item.get("_duration"):
+            eff_len = float(item["_duration"]) - tin
+        return dict(src=item["_abs"], kind=t, start=tin, end=end), eff_len
+
     def _play_item(self, item):
         self.current = item
         gen = self._bump_gen()
         t = item["_type"]
         eff_len = None
-        if t == "image":
-            dur = float(item.get("duration") or 10)
-            self.player.load(item["_abs"], kind="image", hold=dur)
-            eff_len = dur
-        elif t == "stream":
+        vol = int(item.get("volume", 100)) if t != "image" else 100
+        fade_in = float(item.get("fade_in") or 0) if t != "image" else 0
+        fade_out = float(item.get("fade_out") or 0) if t != "image" else 0
+        mixing = getattr(self.player, "supports_transitions", False)
+        # extra load() arguments only the gapless player understands
+        extra = {}
+        if mixing:
+            extra["transition"] = 0.0 if self.playing_default else self.transition
+            extra["volume"] = 0 if fade_in > 0 else vol
+        if t == "stream":
             url = self._resolve_stream(item)
             hold = float(item.get("duration") or 0) or None
             if not url:
@@ -945,23 +992,17 @@ class PlayerEngine:
                          % (item.get("name") or item.get("channel")))
                 self._retry_current(gen)
                 return
+            if mixing:
+                extra["length"] = hold
             self.player.load(url, kind="stream", hold=hold,
-                             subtitles=bool(item.get("subtitles")))
+                             subtitles=bool(item.get("subtitles")), **extra)
             eff_len = hold
         else:
-            tin = float(item.get("in") or 0)
-            tout = item.get("out")
-            end = None
-            if tout not in (None, "", 0):
-                end = float(tout)
-                eff_len = end - tin
-            elif item.get("_duration"):
-                eff_len = float(item["_duration"]) - tin
-            self.player.load(item["_abs"], kind=t, start=tin, end=end)
+            args, eff_len = self._item_args(item)
+            if mixing:
+                extra["length"] = eff_len
+            self.player.load(**args, **extra)
         # volume + fades (videos with audio only)
-        vol = int(item.get("volume", 100)) if t != "image" else 100
-        fade_in = float(item.get("fade_in") or 0) if t != "image" else 0
-        fade_out = float(item.get("fade_out") or 0) if t != "image" else 0
         if fade_in > 0:
             self.player.set_volume(0)
             self._start_fade(gen, 0, vol, fade_in, delay=0)
@@ -985,8 +1026,43 @@ class PlayerEngine:
                 time.sleep(dur / steps)
         threading.Thread(target=run, daemon=True).start()
 
+    def _next_index(self):
+        """Index of the playlist item that follows the current one, or None if
+        the current item is going to play again or the playlist is ending."""
+        if self.playing_default or not self.items:
+            return None
+        if self.loops_left == -1 or self.loops_left > 1:
+            return None                       # same item again
+        i = self.index + 1
+        if i >= len(self.items):
+            if not self.loop_playlist:
+                return None
+            i = 0
+        return i
+
+    @staticmethod
+    def _same_media(a, b):
+        return (a is not None and b is not None and a.get("_abs") == b.get("_abs")
+                and a.get("_abs") is not None
+                and (a.get("in") or 0) == (b.get("in") or 0)
+                and (a.get("out") or None) == (b.get("out") or None))
+
     def _on_event(self, ev):
-        if ev.get("event") != "end-file":
+        name = ev.get("event")
+        if name == "preload":
+            self._preload_next()
+            return
+        if name == "about-to-end":
+            self._crossfade_to_next()
+            return
+        if name == "out-failed":
+            # the gapless player's output pipeline died: rebuild and resume
+            with self.lock:
+                self.log("output pipeline failed; restarting playback")
+                self.player.restart()
+                self.reapply()
+            return
+        if name != "end-file":
             return
         if ev.get("reason") not in ("eof", "error"):
             return  # stop/quit handled elsewhere or manual
@@ -1006,6 +1082,54 @@ class PlayerEngine:
                 return
             self.index += 1             # advance to next item
             self._load_current()
+
+    def _preload_next(self):
+        """Ask the player to get the next item ready (gapless player only)."""
+        with self.lock:
+            ni = self._next_index()
+            if ni is None or not hasattr(self.player, "preload"):
+                return
+            nxt = self.items[ni]
+            if nxt["_type"] == "stream" or self._same_media(self.current, nxt):
+                return                  # streams resolve fresh at play time
+            args, eff_len = self._item_args(nxt)
+            vol = int(nxt.get("volume", 100)) if nxt["_type"] != "image" else 100
+            fade_in = float(nxt.get("fade_in") or 0) if nxt["_type"] != "image" else 0
+            self.player.preload(**args, length=eff_len, volume=0 if fade_in > 0 else vol)
+
+    def _crossfade_to_next(self):
+        """The current item is T seconds from its end: start the next one now,
+        fading in over it. Same bookkeeping as reaching the end of the item."""
+        with self.lock:
+            ni = self._next_index()
+            if ni is None or self.transition <= 0:
+                return
+            if self._same_media(self.current, self.items[ni]):
+                return                  # a single repeating item just loops
+            self.index += 1
+            self._load_current()
+
+
+def make_player(log=print):
+    """The player the app uses. The gapless/cross-fading one (app/mixer.py)
+    unless it is switched off (`"gapless": false` in config.json's settings, or
+    MEDIAPLAYER_LEGACY=1) or can't be built here — then the original one-
+    pipeline-per-item GstPlayer, which blanks the screen between items."""
+    try:
+        enabled = config.load()["settings"].get("gapless", True)
+    except Exception:
+        enabled = True
+    if os.environ.get("MEDIAPLAYER_LEGACY"):
+        enabled = False
+    if enabled:
+        try:
+            from . import mixer
+            return mixer.MixerPlayer(log=log)
+        except Exception as e:  # noqa
+            log("gapless player unavailable (%s); using the legacy player" % e)
+    else:
+        log("gapless player disabled; using the legacy player")
+    return GstPlayer(log=log)
 
 
 # module-level singletons, wired in __init__

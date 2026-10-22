@@ -75,7 +75,7 @@ def create_app():
     # Logs to data/mediaplayer.log as well as stdout — the service's stdout
     # doesn't reach the journal (see app/applog.py).
     log = applog.make_log()
-    gstmod.player = gstmod.GstPlayer(log=log)
+    gstmod.player = gstmod.make_player(log=log)
     gstmod.player.start()
     gstmod.engine = gstmod.PlayerEngine(gstmod.player, log=log)
     gstmod.engine.start_watchdog()
@@ -294,7 +294,7 @@ def create_app():
         def m(c):
             pl = {"id": config.new_id(),
                   "name": body.get("name", "Playlist"),
-                  "items": [], "loop_playlist": True}
+                  "items": [], "loop_playlist": True, "transition_s": 0}
             c["playlists"].append(pl)
             return pl
         return jsonify(config.update(m))
@@ -308,7 +308,7 @@ def create_app():
             pl = config.get_playlist(c, pid)
             if not pl:
                 return None
-            for k in ("name", "items", "loop_playlist"):
+            for k in ("name", "items", "loop_playlist", "transition_s"):
                 if k in body:
                     pl[k] = body[k]
             return pl
@@ -383,7 +383,8 @@ def create_app():
         def m(c):
             for k in ("cec_device", "cec_phys_addr", "default_item",
                       "audio_out", "screenshot_interval", "stream_av_delay_ms",
-                      "stream_resync_interval_s", "transcode_policy"):
+                      "stream_resync_interval_s", "transcode_policy",
+                      "output_resolution", "output_fps"):
                 if k in body:
                     c["settings"][k] = body[k]
         config.update(m)
@@ -391,10 +392,11 @@ def create_app():
             gstmod.player.set_av_delay(body["stream_av_delay_ms"])
         if "stream_resync_interval_s" in body:
             gstmod.player.set_resync_interval(body["stream_resync_interval_s"])
-        # changing the audio output device means rebuilding the pipeline with a
-        # new sink, then resuming whatever was playing
+        # changing the audio output device (or the gapless player's canvas)
+        # means rebuilding the pipeline, then resuming whatever was playing
         if "audio_out" in body:
             gstmod.player.set_audio_device(body["audio_out"] or "auto")
+        if "audio_out" in body or "output_resolution" in body or "output_fps" in body:
             gstmod.player.restart()
             gstmod.engine.reapply()
         return jsonify(_public_config(config.load()))
