@@ -1110,7 +1110,9 @@ class MixerPlayer(_gst.GstPlayer):
             if (succ is not None and succ.cut_in and succ.pic_in_ns
                     and succ.first_out is not None and now >= succ.first_out):
                 a = 0.0
-            if slot.alpha is None or abs(a - slot.alpha) > 0.002:
+            # land exactly on 0 / 1: below 1 the compositor blends every frame
+            if slot.alpha is None or (a != slot.alpha and
+                                      (abs(a - slot.alpha) > 0.002 or a in (0.0, 1.0))):
                 slot.alpha = a
                 try:
                     slot.vpad.set_property("alpha", a)
