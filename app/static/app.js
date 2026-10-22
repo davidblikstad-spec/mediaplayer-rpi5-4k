@@ -140,9 +140,9 @@ function itemRow(it, i) {
     : `<input class="loop" value="${it.loop ?? 1}">`));
   // volume
   tr.appendChild(cell(isImg ? "–" : `<input class="vol" type="number" min="0" max="130" value="${it.volume ?? 100}">`));
-  // fades
-  tr.appendChild(cell(isImg ? "–" : `<input class="fin" type="number" min="0" step="0.1" value="${it.fade_in ?? 0}">`));
-  tr.appendChild(cell(isImg ? "–" : `<input class="fout" type="number" min="0" step="0.1" value="${it.fade_out ?? 0}">`));
+  // fades (picture from / to black, and the sound)
+  tr.appendChild(cell(`<input class="fin" type="number" min="0" step="0.1" value="${it.fade_in ?? 0}">`));
+  tr.appendChild(cell(`<input class="fout" type="number" min="0" step="0.1" value="${it.fade_out ?? 0}">`));
   // actions
   const tda = document.createElement("td");
   tda.innerHTML = `<button class="small prev">▶</button><button class="small danger del">✕</button>`;
@@ -185,6 +185,8 @@ function collectItems() {
     if (src.type === "image") {
       o.duration = parseFloat(g("dur").value) || 10;
       o.loop = 1;
+      o.fade_in = parseFloat(g("fin").value) || 0;
+      o.fade_out = parseFloat(g("fout").value) || 0;
     } else {
       o.in = parseFloat(g("in").value) || 0;
       o.out = g("out").value === "" ? null : parseFloat(g("out").value);
@@ -343,15 +345,53 @@ const PLAY_MODE = {
   sw:    { cls: "ok",   text: "software ≤1080p" },
   heavy: { cls: "warn", text: "software >1080p — may stutter" },
 };
+// files ticked in the media library, for "Delete selected"
+const mediaSelected = new Set();
+function renderMediaSelection() {
+  const n = mediaSelected.size;
+  $("#media-del-selected").textContent = n ? `Delete selected (${n})` : "Delete selected";
+  $("#media-del-selected").disabled = !n;
+  $("#media-select-all").checked = n > 0 && n === mediaList.length;
+  $("#media-select-all").indeterminate = n > 0 && n < mediaList.length;
+  $$("#media-grid .media-card").forEach(c => c.classList.toggle("selected", mediaSelected.has(c.dataset.file)));
+}
+$("#media-select-all").onchange = (e) => {
+  mediaSelected.clear();
+  if (e.target.checked) mediaList.forEach(m => mediaSelected.add(m.file));
+  $$("#media-grid .pick").forEach(cb => cb.checked = e.target.checked);
+  renderMediaSelection();
+};
+$("#media-del-selected").onclick = async () => {
+  const files = [...mediaSelected];
+  if (!files.length) return;
+  const used = files.filter(f => cfg.playlists.some(pl => (pl.items || []).some(it => it.file === f)));
+  let msg = files.length === 1 ? "Delete " + files[0] + "?" : "Delete " + files.length + " files?";
+  if (used.length) msg += "\n\n" + used.length + " of them are used in a playlist:\n" + used.slice(0, 10).join("\n")
+    + (used.length > 10 ? "\n…" : "");
+  if (!confirm(msg)) return;
+  let failed = 0;
+  for (const f of files) {
+    const r = await api("DELETE", "/api/media/" + encodeURIComponent(f));
+    if (!r || !r.ok) failed++;
+  }
+  toast(failed ? `Deleted ${files.length - failed}, ${failed} failed` : `Deleted ${files.length} file${files.length === 1 ? "" : "s"}`);
+  mediaSelected.clear();
+  loadMedia();
+};
 function renderMediaGrid() {
   const g = $("#media-grid"); g.innerHTML = "";
+  // forget ticks on files that are gone
+  [...mediaSelected].forEach(f => { if (!mediaList.some(m => m.file === f)) mediaSelected.delete(f); });
+  $("#media-toolbar").classList.toggle("hidden", !mediaList.length);
+  renderMediaSelection();
   if (!mediaList.length) { g.innerHTML = '<p class="muted">No media uploaded yet.</p>'; return; }
   mediaList.forEach(m => {
     const job = transcodeJobs[m.file];
     const transcoding = job && job.status === "running";
     const mode = m.play_mode;            // "hw" | "sw" | "heavy" | "ok"(non-video)
     const c = document.createElement("div");
-    c.className = "media-card" + (mode === "heavy" ? " heavy" : "");
+    c.className = "media-card" + (mode === "heavy" ? " heavy" : "") + (mediaSelected.has(m.file) ? " selected" : "");
+    c.dataset.file = m.file;
     const thumb = m.thumb ? `<img src="/thumb/${encodeURIComponent(m.thumb)}">` : `<span class="muted">${m.type}</span>`;
     const dur = m.duration ? " · " + Math.round(m.duration) + "s" : "";
     const res = (m.width && m.height) ? " · " + m.width + "×" + m.height : "";
@@ -378,10 +418,14 @@ function renderMediaGrid() {
     actions += `<button class="small danger del">Delete</button>`;
     c.innerHTML = `
       <div class="thumb">${thumb}${badge}</div>
-      <div class="meta"><div class="name">${esc(m.file)}</div><div class="muted">${m.type}${cod}${res}${dur} · ${(m.size / 1048576).toFixed(1)} MB</div></div>
+      <div class="meta"><label class="name pick-label"><input type="checkbox" class="pick" ${mediaSelected.has(m.file) ? "checked" : ""}> <span>${esc(m.file)}</span></label><div class="muted">${m.type}${cod}${res}${dur} · ${(m.size / 1048576).toFixed(1)} MB</div></div>
       <div class="actions">${actions}</div>`;
     c.querySelector(".thumb").onclick = () => previewMedia(m.file, m.type);
     c.querySelector(".prev").onclick = () => previewMedia(m.file, m.type);
+    c.querySelector(".pick").onchange = (e) => {
+      if (e.target.checked) mediaSelected.add(m.file); else mediaSelected.delete(m.file);
+      renderMediaSelection();
+    };
     c.querySelector(".del").onclick = async () => {
       if (!confirm("Delete " + m.file + "?")) return;
       await api("DELETE", "/api/media/" + encodeURIComponent(m.file)); loadMedia();

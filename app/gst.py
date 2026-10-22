@@ -982,6 +982,9 @@ class PlayerEngine:
         if mixing:
             extra["transition"] = 0.0 if self.playing_default else self.transition
             extra["volume"] = 0 if fade_in > 0 else vol
+            # the picture fades too, images included
+            extra["fade_in"] = float(item.get("fade_in") or 0)
+            extra["fade_out"] = float(item.get("fade_out") or 0)
         if t == "stream":
             url = self._resolve_stream(item)
             hold = float(item.get("duration") or 0) or None

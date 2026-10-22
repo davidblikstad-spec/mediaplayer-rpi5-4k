@@ -608,11 +608,59 @@ def scenario_volume(media):
     r.stop()
 
 
+def scenario_pic_fade(media):
+    """Item fades from / to black: an image (fade in + out), then a video that
+    fades in after a hard cut, then the same image with no fades."""
+    print("scenario: picture fades on items (from / to black)")
+    r = Rig()
+    r.play([item(media, "blue.png", duration=3, fade_in=1, fade_out=1),
+            item(media, "red.mp4", **{"in": 0, "out": 3, "_test_dur": 6, "fade_in": 1}),
+            item(media, "blue.png", duration=2)])
+    time.sleep(9)
+
+    def level(yuv, colour):
+        """How far `yuv` is from black towards `colour` (0 black .. 1 full)."""
+        k, c = COLOURS["black"], COLOURS[colour]
+        d = [b - a for a, b in zip(k, c)]
+        return sum((y - a) * e for y, a, e in zip(yuv, k, d)) / float(sum(e * e for e in d))
+    fr = [(p, yuv, classify(yuv)) for p, yuv, _c in r.cap.frames]
+    print("  " + describe(r.cap.runs()))
+    t0 = next((p for p, yuv, _ in fr if level(yuv, "blue") > 0.05), None)
+    check(t0 is not None, "the image appears")
+    if t0 is None:
+        r.stop()
+        return
+    blue = [(p - t0, level(yuv, "blue")) for p, yuv, _ in fr if t0 <= p < t0 + 3.0]
+    up = [l for p, l in blue if p < 0.9]
+    check(len(up) > 15 and all(b >= a - 0.02 for a, b in zip(up, up[1:])) and up[0] < 0.3,
+          "the image fades up from black (%.2f -> %.2f over %d frames)"
+          % (up[0] if up else -1, up[-1] if up else -1, len(up)))
+    check(any(l > 0.97 for p, l in blue if 1.1 < p < 1.9), "and reaches full brightness")
+    down = [l for p, l in blue if 2.1 < p < 2.95]
+    check(len(down) > 10 and all(b <= a + 0.02 for a, b in zip(down, down[1:])) and down[-1] < 0.25,
+          "then fades down to black (%.2f -> %.2f)" % (down[0] if down else -1, down[-1] if down else -1))
+    after = [(p - t0, yuv, c) for p, yuv, c in fr if t0 + 3.0 <= p < t0 + 6.0]
+    check(not [1 for p, yuv, c in after if p < 5.5 and level(yuv, "blue") > 0.3],
+          "the faded-out image does not show again under the next item")
+    red = [(p, level(yuv, "red")) for p, yuv, c in after]
+    t1 = next((p for p, l in red if l > 0.05), None)
+    check(t1 is not None and t1 < 3.3, "the video follows the image (at %s s)" % t1)
+    if t1 is not None:
+        rup = [l for p, l in red if t1 <= p < t1 + 0.9]
+        check(len(rup) > 15 and all(b >= a - 0.03 for a, b in zip(rup, rup[1:])) and rup[0] < 0.3,
+              "the video fades up from black (%.2f -> %.2f)" % (rup[0] if rup else -1, rup[-1] if rup else -1))
+        check(any(l > 0.97 for p, l in red if t1 + 1.1 < p < t1 + 2.5), "and reaches full brightness")
+    last = [c[0] for p, yuv, c in fr if p >= t0 + 6.2 and p < t0 + 7.8]
+    check(last and all(n == "blue" for n in last), "an item without fades is shown at full brightness")
+    r.stop()
+
+
 SCENARIOS = {"cut": scenario_cut, "loop": scenario_loop, "fade": scenario_fade,
              "sync": scenario_sync, "letterbox": scenario_letterbox, "skip": scenario_skip,
              "pause": scenario_pause, "stills": scenario_still_fade, "stream": scenario_stream,
              "loopsfade": scenario_loops_fade, "default": scenario_default_restart,
-             "screenshot": scenario_screenshot, "splash": scenario_splash, "volume": scenario_volume, "soak": scenario_soak}
+             "screenshot": scenario_screenshot, "splash": scenario_splash, "volume": scenario_volume,
+             "picfade": scenario_pic_fade, "soak": scenario_soak}
 
 
 def main():

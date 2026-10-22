@@ -76,7 +76,7 @@
         <table id="pl-items" class="items">
           <thead><tr>
             <th></th><th>File</th><th>Type</th><th>In</th><th>Out / Dur</th>
-            <th>Loops</th><th>Vol</th><th>Fade in</th><th>Fade out</th><th></th>
+            <th>Loops</th><th>Vol</th><th title="Seconds to fade the picture up from black (and the sound up)">Fade in</th><th title="Seconds to fade the picture down to black (and the sound down) at the end">Fade out</th><th></th>
           </tr></thead>
           <tbody></tbody>
         </table>
@@ -104,6 +104,10 @@
         <button id="upload-cancel" class="small danger">Cancel</button>
       </div>
       <div id="transcode-list"></div>
+      <div id="media-toolbar" class="toolbar hidden">
+        <label class="inline"><input type="checkbox" id="media-select-all"> Select all</label>
+        <button id="media-del-selected" class="small danger" disabled>Delete selected</button>
+      </div>
       <div id="media-grid" class="media-grid"></div>
     </section>
 

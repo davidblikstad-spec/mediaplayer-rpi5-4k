@@ -77,6 +77,9 @@ table.items input.vol{width:56px}
 .media-card .meta .name{word-break:break-all}
 .media-card .actions{display:flex;gap:.3rem;padding:0 .5rem .5rem;flex-wrap:wrap}
 .media-card.heavy{border-color:var(--danger)}
+.media-card.selected{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent)}
+.media-card .pick-label{display:flex;gap:.35rem;align-items:flex-start;color:var(--fg);font-size:inherit;cursor:pointer}
+.media-card .pick{margin-top:.1rem;flex:none}
 .media-card.disabled{cursor:not-allowed}
 .media-card.disabled .thumb{cursor:not-allowed}
 .badge{position:absolute;left:.35rem;top:.35rem;right:.35rem;font-size:.68rem;line-height:1.2;padding:.2rem .4rem;border-radius:5px;background:rgba(0,0,0,.65);color:#fff;text-align:center}
@@ -104,3 +107,4 @@ table.items input.vol{width:56px}
 .picker-list{display:grid;grid-template-columns:repeat(auto-fill,minmax(130px,1fr));gap:.6rem;margin-top:.6rem}
 .picker-list .media-card{cursor:pointer}
 #pl-transition-note.hidden{display:none}
+#media-toolbar.hidden{display:none}

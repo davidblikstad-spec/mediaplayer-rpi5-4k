@@ -161,6 +161,11 @@ class _Slot:
         # transition bookkeeping
         self.fade_in_ns = 0                   # cross-fade length into this slot
         self.xfade_ns = 0                     # cross-fade length wanted out of it
+        self.xp = 1.0                         # cross-fade progress (picture alpha factor)
+        self.cut_in = True                    # started by a cut, not a cross-fade
+        # the item's own picture fades, from / to black, every pass
+        self.pic_in_ns = self.pic_out_ns = 0
+        self.alpha = None                     # last alpha set on vpad
         self.predecessor = None
         self.successor = None
         self.retire_after_ns = RETIRE_MARGIN_NS
@@ -303,7 +308,7 @@ class _Out:
             pad = self.vmix.request_pad(self.vmix.get_pad_template("sink_%u"), None, None)
             vs.get_static_pad("src").link(pad)
             pad.set_property("zorder", z)
-            pad.set_property("alpha", 0.0 if slot.fade_in_ns else 1.0)
+            pad.set_property("alpha", 0.0 if slot.fade_in_ns or slot.pic_in_ns else 1.0)
             vs.sync_state_with_parent()
             slot.vsrc, slot.vpad = vs, pad
         if with_audio:
@@ -691,7 +696,7 @@ class MixerPlayer(_gst.GstPlayer):
 
     # ---- loading ---------------------------------------------------------
     def load(self, src, *, kind, start=0.0, end=None, hold=None, subtitles=False,
-             transition=0.0, length=None, volume=None):
+             transition=0.0, length=None, volume=None, fade_in=0.0, fade_out=0.0):
         """Show `src`. Same contract as GstPlayer.load, plus:
 
         transition  cross-fade length (s) to use if the previous item is
@@ -699,6 +704,8 @@ class MixerPlayer(_gst.GstPlayer):
         length      how long this item plays, if known (s) — needed to
                     cross-fade out of it.
         volume      initial playback volume, 0..100+ (default: the last one).
+        fade_in     fade the picture up from black over this many seconds.
+        fade_out    fade it down to black over the last seconds (needs length).
         """
         with self._lock:
             self._cancel_image_timer()
@@ -716,6 +723,7 @@ class MixerPlayer(_gst.GstPlayer):
             cur = self.cur
             if (cur is not None and not cur.dead and cur.key == key and kind != "stream"
                     and self._same_again(cur, hold, length, volume, transition)):
+                self._set_pic_fades(cur, fade_in, fade_out)
                 return
             slot = None
             if self.next is not None:
@@ -730,7 +738,17 @@ class MixerPlayer(_gst.GstPlayer):
             if slot is None:
                 self._fail_later(0.05)                   # this item is the problem: move on
                 return
+            self._set_pic_fades(slot, fade_in, fade_out)
             self._start_slot(slot, transition)
+
+    @staticmethod
+    def _set_pic_fades(slot, fade_in, fade_out):
+        def ns(seconds):
+            try:
+                return int(max(0.0, min(60.0, float(seconds or 0))) * SEC)
+            except (TypeError, ValueError):
+                return 0
+        slot.pic_in_ns, slot.pic_out_ns = ns(fade_in), ns(fade_out)
 
     @property
     def current_slot_id(self):
@@ -792,6 +810,8 @@ class MixerPlayer(_gst.GstPlayer):
             prev.retire_after_ns = xf + RETIRE_MARGIN_NS
             self.old.append(prev)
         slot.fade_in_ns = xf
+        slot.xp = 0.0 if xf else 1.0
+        slot.cut_in = not xf
         slot.xfade_ns = self._clamp_xfade(transition)
         slot.request_at = request_at
         slot.reset_pass()
@@ -1009,6 +1029,8 @@ class MixerPlayer(_gst.GstPlayer):
         cur = self.cur
         if cur is not None and cur.fade_in_ns and cur.first_out is not None:
             self._ramp(cur, now)
+        if not self._paused:
+            self._set_alphas(now)
         self._retire_old(now)
         if cur is not None and not cur.dead and not self._paused and cur.E:
             left = cur.E - now
@@ -1047,9 +1069,8 @@ class MixerPlayer(_gst.GstPlayer):
         """Drive the cross-fade: the new item's alpha and volume up, the old one's down."""
         p = (now - cur.first_out) / float(cur.fade_in_ns)
         p = min(1.0, max(0.0, p))
+        cur.xp = p
         try:
-            if cur.vpad is not None:
-                cur.vpad.set_property("alpha", p)
             if cur.apad is not None:
                 cur.apad.set_property("volume", math.sin(p * math.pi / 2))
             prev = cur.predecessor
@@ -1059,6 +1080,42 @@ class MixerPlayer(_gst.GstPlayer):
             self.log("cross-fade ramp: %s" % e)
         if p >= 1.0:
             cur.fade_in_ns = 0
+
+    @staticmethod
+    def _pic_level(slot, now):
+        """0..1: where the slot's own fade from / to black stands at `now`."""
+        if not (slot.pic_in_ns or slot.pic_out_ns):
+            return 1.0
+        if slot.origin is None:                       # nothing shown yet
+            return 0.0 if slot.pic_in_ns else 1.0
+        level = 1.0
+        end = slot.E
+        begin = end - slot.length_ns if end and slot.length_ns else slot.origin
+        if slot.pic_in_ns:
+            level = min(level, (now - begin) / float(slot.pic_in_ns))
+        if slot.pic_out_ns and end:
+            level = min(level, (end - now) / float(slot.pic_out_ns))
+        return min(1.0, max(0.0, level))
+
+    def _set_alphas(self, now):
+        """Picture alpha of every slot on screen: cross-fade progress times
+        its own fade. An item that fades up from black after a cut hides the
+        one it replaced at once, or that would show through until retired."""
+        cur = self.cur
+        for slot in [cur] + self.old:
+            if slot is None or slot.dead or slot.vpad is None:
+                continue
+            a = slot.xp * self._pic_level(slot, now)
+            succ = slot.successor
+            if (succ is not None and succ.cut_in and succ.pic_in_ns
+                    and succ.first_out is not None and now >= succ.first_out):
+                a = 0.0
+            if slot.alpha is None or abs(a - slot.alpha) > 0.002:
+                slot.alpha = a
+                try:
+                    slot.vpad.set_property("alpha", a)
+                except Exception as e:  # noqa
+                    self.log("picture fade: %s" % e)
 
     def _retire_old(self, now):
         """Remove an outgoing slot once the one that replaced it is on screen."""
