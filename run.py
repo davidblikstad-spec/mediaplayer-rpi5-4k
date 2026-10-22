@@ -13,6 +13,17 @@ for _v in ("TMPDIR", "TEMP", "TMP"):
     os.environ[_v] = _TMP
 tempfile.tempdir = _TMP
 
+# The gapless player (app/mixer.py) builds a decoder pipeline per playlist item,
+# many threads coming and going all day. With glibc's default of one malloc
+# arena per thread that fragments the heap into a few hundred MB that is never
+# returned (it levels off, it is not a leak). Two arenas keeps the footprint at
+# less than half. Must run before any other thread exists, hence here.
+try:
+    import ctypes
+    ctypes.CDLL("libc.so.6").mallopt(-8, 2)          # M_ARENA_MAX
+except Exception:
+    pass
+
 from app import create_app
 from app import applog, config
 

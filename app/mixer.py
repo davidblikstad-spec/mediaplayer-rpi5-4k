@@ -81,6 +81,10 @@ RETIRE_MARGIN_NS = 150 * MSEC
 TICK_S = 0.02
 # Compositor / audiomixer extra latency (ns): tolerance for late upstream data.
 MIXER_LATENCY_NS = 40 * MSEC
+# Live appsrcs report max-latency 0 unless told otherwise, which the mixers
+# (whose live sources report a few ms of min latency) reject — they then fall
+# back to waiting for every pad forever, so one silent video stalls the audio.
+APPSRC_MAX_LATENCY_NS = 5 * SEC
 # Appsrc queue sizes
 VIDEO_QUEUE_FRAMES = 6
 AUDIO_QUEUE_S = 0.3
@@ -130,8 +134,10 @@ class _Slot:
         self.subtitles = bool(subtitles)
         self.key = (kind, src, round(self.start, 3), self.end, self.subtitles)
         self.pipe = None                      # the source pipeline (playbin3 or custom)
+        self.bus = None
         self.pb = None                        # the playbin3, if there is one
         self.vsink = self.asink = None        # appsinks at the end of the source pipeline
+        self.sink_handlers = []               # (appsink, handler id): disconnected on dispose
         self.vsrc = self.asrc = None          # appsrcs inside the output pipeline
         self.vpad = self.apad = None          # their compositor / audiomixer pads
         self.dead = False
@@ -153,14 +159,12 @@ class _Slot:
         self.xfade_ns = 0                     # cross-fade length wanted out of it
         self.predecessor = None
         self.successor = None
-        self.pass_no = 0                      # bumped on every loop / restart
         self.retire_after_ns = RETIRE_MARGIN_NS
         self.volume = 1.0
         self.audio_delay_ns = 0
         self.vfps = None
 
     def reset_pass(self):
-        self.pass_no += 1
         self.eof_sent = self.ate_sent = self.preload_sent = False
         self.eos = False
 
@@ -174,8 +178,8 @@ class _Out:
         self.ok = False
         self._zorder = itertools.count(1)
         self._warned = set()
-        self.events = queue.Queue()
         self.pipe = Gst.Pipeline.new("out")
+        self.bus = self.pipe.get_bus()
         self.pipe.use_clock(Gst.SystemClock.obtain())
 
         mk = Gst.ElementFactory.make
@@ -235,21 +239,26 @@ class _Out:
         spad = self.amix.request_pad(self.amix.get_pad_template("sink_%u"), None, None)
         scaps.get_static_pad("src").link(spad)
 
-        self.pipe.get_bus().set_sync_handler(self._on_bus)
 
     # -- bus ------------------------------------------------------------
-    def _on_bus(self, _bus, msg):
-        t = msg.type
-        if t == Gst.MessageType.ERROR:
-            err, dbg = msg.parse_error()
-            self.events.put(("error", "%s (%s)" % (err, dbg)))
-        elif t == Gst.MessageType.WARNING:
-            w, dbg = msg.parse_warning()
-            text = str(w.message)
-            if text not in self._warned and len(self._warned) < 20:
-                self._warned.add(text)
-                self.log("output pipeline warning: %s (%s)" % (text, dbg))
-        return Gst.BusSyncReply.DROP
+    # Polled, not a sync handler: PyGObject leaks the bus (two file descriptors
+    # and its memory) of every pipeline that has had a sync handler set.
+    def poll(self):
+        """Drain the bus; returns the text of any errors. Warnings are logged once."""
+        errors = []
+        while True:
+            msg = self.bus.pop()
+            if msg is None:
+                return errors
+            if msg.type == Gst.MessageType.ERROR:
+                err, dbg = msg.parse_error()
+                errors.append("%s (%s)" % (err, dbg))
+            elif msg.type == Gst.MessageType.WARNING:
+                w, dbg = msg.parse_warning()
+                text = str(w.message)
+                if text not in self._warned and len(self._warned) < 20:
+                    self._warned.add(text)
+                    self.log("output pipeline warning: %s (%s)" % (text, dbg))
 
     # -- lifecycle ----------------------------------------------------
     def start(self, timeout=8):
@@ -279,6 +288,8 @@ class _Out:
             vs.set_property("is-live", True)
             vs.set_property("do-timestamp", False)
             vs.set_property("block", True)
+            vs.set_property("min-latency", 0)
+            vs.set_property("max-latency", APPSRC_MAX_LATENCY_NS)
             vs.set_property("max-bytes", self.w * self.h * 3 // 2 * VIDEO_QUEUE_FRAMES)
             self.pipe.add(vs)
             pad = self.vmix.request_pad(self.vmix.get_pad_template("sink_%u"), None, None)
@@ -294,6 +305,8 @@ class _Out:
             as_.set_property("is-live", True)
             as_.set_property("do-timestamp", False)
             as_.set_property("block", True)
+            as_.set_property("min-latency", 0)
+            as_.set_property("max-latency", APPSRC_MAX_LATENCY_NS)
             as_.set_property("max-bytes", int(AUDIO_RATE * 8 * AUDIO_QUEUE_S))
             self.pipe.add(as_)
             pad = self.amix.request_pad(self.amix.get_pad_template("sink_%u"), None, None)
@@ -347,7 +360,6 @@ class MixerPlayer(_gst.GstPlayer):
         self.cur = None                    # slot on screen / most recently started
         self.next = None                   # preloaded slot, prerolled but not started
         self.old = []                      # outgoing slots, waiting to be retired
-        self._q = queue.Queue()            # bus events from item pipelines
         self._events = queue.Queue()       # events on their way to the engine
         self._worker = None
         self._out_lock = threading.RLock()
@@ -491,7 +503,7 @@ class MixerPlayer(_gst.GstPlayer):
             self.log("could not build %s pipeline: %s" % (kind, e))
             self._dispose(slot)
             return None
-        slot.pipe.get_bus().set_sync_handler(self._on_slot_bus, slot)
+        slot.bus = slot.pipe.get_bus()
         if kind == "stream":
             slot.audio_delay_ns = self._av_delay_ms * MSEC
         slot.pipe.set_state(Gst.State.PAUSED)
@@ -523,8 +535,8 @@ class MixerPlayer(_gst.GstPlayer):
         slot.pipe = slot.pb = pb
         slot.vsink = vbin.get_by_name("vsink")
         slot.asink = abin.get_by_name("asink")
-        slot.vsink.connect("new-sample", self._on_sample, slot, True)
-        slot.asink.connect("new-sample", self._on_sample, slot, False)
+        self._connect_sink(slot, slot.vsink, True)
+        self._connect_sink(slot, slot.asink, False)
 
     def _build_still(self, slot):
         """A single canvas-sized frame (an image, or the boot splash). One
@@ -549,7 +561,11 @@ class MixerPlayer(_gst.GstPlayer):
             pipe.get_by_name("t").set_property("text", slot.src)
         slot.pipe = pipe
         slot.vsink = pipe.get_by_name("vsink")
-        slot.vsink.connect("new-sample", self._on_sample, slot, True)
+        self._connect_sink(slot, slot.vsink, True)
+
+    def _connect_sink(self, slot, sink, is_video):
+        slot.sink_handlers.append(
+            (sink, sink.connect("new-sample", self._on_sample, slot, is_video)))
 
     def _dispose(self, slot):
         """Stop a slot's pipelines and release its branches in the output."""
@@ -563,6 +579,22 @@ class MixerPlayer(_gst.GstPlayer):
             slot.pipe.set_state(Gst.State.NULL)
         if slot.attached and self.out is not None:
             self.out.detach(slot)
+        self._release(slot)
+
+    @staticmethod
+    def _release(slot):
+        """Break the reference cycle (the appsink callbacks hold the slot, the
+        slot holds the pipeline) so the GStreamer objects are actually freed —
+        each leaked pipeline costs file descriptors and megabytes, which adds
+        up over weeks of playlist loops."""
+        for sink, hid in slot.sink_handlers:
+            try:
+                sink.disconnect(hid)
+            except Exception:
+                pass
+        slot.sink_handlers = []
+        slot.pipe = slot.pb = slot.bus = slot.vsink = slot.asink = None
+        slot.predecessor = slot.successor = None
 
     # ---- the data path ---------------------------------------------------
     def _anchor(self, slot, rt):
@@ -610,14 +642,6 @@ class MixerPlayer(_gst.GstPlayer):
         ret = src.emit("push-buffer", nb)
         return Gst.FlowReturn.OK if ret in (Gst.FlowReturn.OK, Gst.FlowReturn.FLUSHING,
                                              Gst.FlowReturn.EOS) else ret
-
-    def _on_slot_bus(self, _bus, msg, slot):
-        if msg.type == Gst.MessageType.EOS:
-            self._q.put(("eos", slot, slot.pass_no, None))
-        elif msg.type == Gst.MessageType.ERROR:
-            err, dbg = msg.parse_error()
-            self._q.put(("error", slot, slot.pass_no, "%s (%s)" % (err, dbg)))
-        return Gst.BusSyncReply.DROP
 
     # ---- loading ---------------------------------------------------------
     def load(self, src, *, kind, start=0.0, end=None, hold=None, subtitles=False,
@@ -737,6 +761,8 @@ class MixerPlayer(_gst.GstPlayer):
         if not self._seek(slot, slot.start, slot.end):
             return False
         slot.reset_pass()
+        while slot.bus.pop() is not None:                # stale EOS of the pass just ended
+            pass
         slot.reanchor = True
         slot.request_at = slot.last_end or None          # continue where the last pass ended
         slot.last_end = 0
@@ -847,20 +873,32 @@ class MixerPlayer(_gst.GstPlayer):
     def _run(self):
         while not self._stop:
             try:
-                try:
-                    kind, slot, pass_no, text = self._q.get(timeout=TICK_S)
-                except queue.Empty:
-                    kind = None
-                events = []
+                time.sleep(TICK_S)
                 with self._lock:
-                    if kind is not None:
-                        events += self._on_item_event(kind, slot, pass_no, text)
-                    events += self._tick()
+                    events = self._poll_buses() + self._tick()
                 for ev in events:
                     self._events.put(ev)
             except Exception as e:  # noqa - the worker must never die
                 self.log("player worker error: %s" % e)
                 time.sleep(0.2)
+
+    def _poll_buses(self):
+        """EOS / errors of the source pipelines (the bus is polled, not
+        watched: see _Out.poll)."""
+        events = []
+        for slot in [self.cur, self.next] + list(self.old):
+            if slot is None or slot.dead or slot.bus is None:
+                continue
+            while True:
+                msg = slot.bus.pop()
+                if msg is None:
+                    break
+                if msg.type == Gst.MessageType.EOS:
+                    events += self._on_item_event("eos", slot, None)
+                elif msg.type == Gst.MessageType.ERROR:
+                    err, dbg = msg.parse_error()
+                    events += self._on_item_event("error", slot, "%s (%s)" % (err, dbg))
+        return events
 
     def _dispatch(self):
         """Delivers events to the engine on its own thread, so a slow handler
@@ -872,9 +910,7 @@ class MixerPlayer(_gst.GstPlayer):
                 continue
             self._emit(ev)
 
-    def _on_item_event(self, kind, slot, pass_no, text):
-        if slot.dead or pass_no != slot.pass_no:
-            return []                                    # from before a loop / restart
+    def _on_item_event(self, kind, slot, text):
         if kind == "eos":
             slot.eos = True
             if slot is not self.cur or slot.kind in ("image", "splash") or slot.eof_sent:
@@ -896,11 +932,7 @@ class MixerPlayer(_gst.GstPlayer):
         if out is None:
             return []
         events = []
-        while True:                                      # output pipeline trouble
-            try:
-                _kind, text = out.events.get_nowait()
-            except queue.Empty:
-                break
+        for text in out.poll():                          # output pipeline trouble
             self.log("output pipeline error: %s" % text)
             out.ok = False
             events.append({"event": "out-failed"})
