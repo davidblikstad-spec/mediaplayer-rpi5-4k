@@ -63,6 +63,7 @@ class Capture:
     def __init__(self):
         self.frames = []          # (out_pts_s, yuv_at_centre, (alpha-ish), name)
         self.audio = []           # (out_pts_s, rms, zero_crossings_per_s)
+        self.peak = []            # (out_pts_s, brightest sampled luma): finds text on black
         self.lock = threading.Lock()
 
     def vsink(self):
@@ -82,9 +83,11 @@ class Capture:
             u = d[W * H + (cy // 2) * (W // 2) + cx // 2]
             v = d[W * H + (W // 2) * (H // 2) + (cy // 2) * (W // 2) + cx // 2]
             corner = d[2 * W + 2]                    # near the top-left: letterbox bars?
+            peak = max(d[0:W * H:5])
             buf.unmap(mi)
             with self.lock:
                 self.frames.append((buf.pts / 1e9, (y, u, v), corner))
+                self.peak.append((buf.pts / 1e9, peak))
             return Gst.FlowReturn.OK
         s.connect("new-sample", on)
         return s
@@ -151,6 +154,14 @@ def make_media(d):
        "sine=f=1000:d=4:r=48000,volume='if(between(t,1,1.4),1,0)':eval=frame",
        "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-c:a", "aac",
        os.path.join(d, "sync.mp4"))
+    # a short HLS "live channel": blue with a 660 Hz tone, served over local HTTP
+    hls = os.path.join(d, "hls")
+    os.makedirs(hls)
+    ff("-f", "lavfi", "-i", "color=c=blue:s=1280x720:r=25:d=10", "-f", "lavfi", "-i",
+       "sine=f=660:d=10:r=48000", "-c:v", "libx264", "-preset", "ultrafast", "-g", "50",
+       "-pix_fmt", "yuv420p", "-c:a", "aac", "-f", "hls", "-hls_time", "2",
+       "-hls_playlist_type", "vod", "-hls_segment_filename", os.path.join(hls, "s%d.ts"),
+       os.path.join(hls, "s.m3u8"))
     return {n: os.path.join(d, n) for n in os.listdir(d)}
 
 
@@ -383,7 +394,6 @@ def scenario_pause(media):
     r.play([item(media, "red.mp4", **{"in": 0, "out": 4, "_test_dur": 6})])
     time.sleep(1.5)
     r.player.toggle_pause()
-    n0 = len(r.cap.frames)
     time.sleep(1.5)
     r.player.toggle_pause()
     time.sleep(4.5)
@@ -448,9 +458,155 @@ def scenario_soak(media):
     r.stop()
 
 
+def scenario_stream(media):
+    """file -> HLS stream (ends after 3 s like a playlist 'duration') -> file."""
+    import functools
+    import http.server
+    print("scenario: live stream between files")
+    handler = functools.partial(http.server.SimpleHTTPRequestHandler,
+                                directory=os.path.join(os.path.dirname(media["red.mp4"]), "hls"))
+    handler.log_message = lambda *a, **k: None
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    url = "http://127.0.0.1:%d/s.m3u8" % srv.server_address[1]
+    r = Rig()
+    items = [item(media, "red.mp4", **{"in": 0, "out": 2, "_test_dur": 6}),
+             {"type": "stream", "url": url, "name": "test", "duration": 3, "subtitles": False},
+             item(media, "green.mp4", **{"in": 0, "out": 2, "_test_dur": 6})]
+    r.play(items)
+    time.sleep(11)
+    runs = r.cap.runs()
+    print("  " + describe(runs))
+    names = [x[0] for x in runs if x[0] != "black"]
+    check(names[:3] == ["red", "blue", "green"], "red, then the stream (blue), then green: %s" % names)
+    check(not black_frames_after_start(r.cap), "no black frame, including while the stream starts up")
+    blue = [x for x in runs if x[0] == "blue"]
+    if blue:
+        check(2.5 < blue[0][2] - blue[0][1] + 0.04 < 3.6, "stream shown for ~3 s (%.2f s)" % (blue[0][2] - blue[0][1] + 0.04))
+    tone = [x for x in r.cap.audio if 2.4 < x[0] < 4.4 and x[1] > 0.05]
+    check(bool(tone) and abs(sum(z for _p, _r, z in tone) / len(tone) - 660) < 120,
+          "the stream's 660 Hz audio is heard (%s Hz)" % (round(sum(z for _p, _r, z in tone) / len(tone)) if tone else None))
+    r.stop()
+    srv.shutdown()
+
+
+def scenario_loops_fade(media):
+    """red x2 (loop count) then a 0.6 s fade into green: loops must stay hard, the fade only on the last pass."""
+    print("scenario: loop count + cross-fade")
+    r = Rig()
+    r.play([item(media, "red.mp4", **{"in": 0, "out": 1.5, "_test_dur": 6, "loop": 2}),
+            item(media, "green.mp4", **{"in": 0, "out": 2, "_test_dur": 6})], transition=0.6)
+    time.sleep(7.5)
+    runs = r.cap.runs()
+    print("  " + describe(runs))
+    names = [x[0] for x in runs if x[0] != "black"]
+    check(names[:3] == ["red", "mix", "green"], "red (both passes, no seam), one fade, green: %s" % names)
+    reds = [x for x in runs if x[0] == "red"]
+    if reds:
+        check(reds[0][2] - reds[0][1] > 2.0, "red plays through its loop before fading (%.2f s)" % (reds[0][2] - reds[0][1]))
+    check(not black_frames_after_start(r.cap), "no black frame")
+    r.stop()
+
+
+def scenario_default_restart(media):
+    """default item loops; a playlist replaces it without black; restart() recovers."""
+    print("scenario: default item, replace, restart")
+    r = Rig()
+    import app.config as cfgmod
+    dflt = item(media, "blue.png", duration=1.0)
+    orig_load = cfgmod.load
+
+    def fake_load():
+        c = orig_load()
+        c["settings"]["default_item"] = dflt
+        return c
+    cfgmod.load = fake_load
+    try:
+        r.engine.play_default()
+        time.sleep(3.5)                                  # a still re-armed twice
+        r.play([item(media, "red.mp4", **{"in": 0, "out": 2, "_test_dur": 6})])
+        time.sleep(1.0)
+        r.player.restart()
+        r.engine.reapply()
+        time.sleep(3.5)
+    finally:
+        cfgmod.load = orig_load
+    runs = r.cap.runs()
+    print("  " + describe(runs))
+    names = [x[0] for x in runs]
+    check("blue" in names and "red" in names, "default (blue) then the playlist (red): %s" % names)
+    i = names.index("red")
+    check(i > 0 and names[i - 1] == "blue" and runs[i][1] - runs[i - 1][2] < 4.5 / FPS,
+          "default -> playlist without a gap")
+    check(names.count("red") >= 1 and names[-1] in ("blue", "red", "black"),
+          "playback resumed after restart()")
+    r.stop()
+
+
+def scenario_screenshot(media):
+    print("scenario: HDMI snapshot")
+    r = Rig()
+    r.play([item(media, "red.mp4", **{"in": 0, "out": 3, "_test_dur": 6})])
+    time.sleep(1.5)
+    path = os.path.join(tempfile.mkdtemp(), "live.jpg")
+    r.player.screenshot(path)
+    time.sleep(1.5)
+    ok = os.path.exists(path)
+    check(ok, "a snapshot JPEG was written")
+    if ok:
+        out = subprocess.run(["ffmpeg", "-loglevel", "error", "-i", path, "-vf", "scale=1:1",
+                              "-pix_fmt", "rgb24", "-f", "rawvideo", "-"], capture_output=True).stdout
+        check(len(out) == 3 and out[0] > 200 and out[1] < 60 and out[2] < 60, "and it shows red (rgb %s)" % list(out))
+    r.stop()
+
+
+def scenario_splash(media):
+    """The boot splash (text on black) hands over to a video without a black gap."""
+    print("scenario: boot splash")
+    r = Rig()
+    r.player.splash("The Event AS\nOpen in a browser:\nhttp://10.0.0.5:8080")
+    time.sleep(2.0)
+    shown = [p for p, y in r.cap.peak if y > 150]
+    check(bool(shown), "the splash text is drawn (%d bright frames)" % len(shown))
+    r.play([item(media, "red.mp4", **{"in": 0, "out": 1.5, "_test_dur": 6})])
+    time.sleep(3.0)
+    runs = r.cap.runs()
+    print("  " + describe(runs))
+    i = next((k for k, x in enumerate(runs) if x[0] == "red"), None)
+    check(i is not None and i > 0, "the video replaced the splash")
+    if i:
+        before = [p for p, y in r.cap.peak if y > 150]
+        gap = runs[i][1] - max(before)
+        check(gap < 4.5 / FPS, "splash -> video without a black gap (%.0f ms)" % (gap * 1000))
+    r.stop()
+
+
+def scenario_volume(media):
+    """per-item volume and fade-in/fade-out (driven by the engine) reach the audio output."""
+    print("scenario: item volume and audio fades")
+    r = Rig()
+    r.play([item(media, "red.mp4", **{"in": 0, "out": 3, "_test_dur": 6, "volume": 100, "fade_in": 1.5}),
+            item(media, "red.mp4", **{"in": 0, "out": 3, "_test_dur": 6, "volume": 50, "fade_out": 1.5})])
+    time.sleep(8.0)
+
+    def rms(a, b):
+        xs = [x[1] for x in r.cap.audio if a <= x[0] < b]
+        return sum(xs) / len(xs) if xs else 0.0
+    start, mid, full = rms(0.4, 0.7), rms(1.0, 1.3), rms(2.0, 3.0)
+    check(start < 0.5 * full and start < mid < full * 1.05,
+          "fade-in ramps the volume up: %.3f -> %.3f -> %.3f" % (start, mid, full))
+    half = rms(3.6, 4.6)
+    check(0.35 < half / full < 0.65, "volume 50 plays at about half the level (%.2f of full)" % (half / full))
+    tail_a, tail_b = rms(4.0, 4.5), rms(5.6, 5.9)
+    check(tail_b < 0.6 * tail_a, "fade-out brings it down at the end (%.3f -> %.3f)" % (tail_a, tail_b))
+    r.stop()
+
+
 SCENARIOS = {"cut": scenario_cut, "loop": scenario_loop, "fade": scenario_fade,
              "sync": scenario_sync, "letterbox": scenario_letterbox, "skip": scenario_skip,
-             "pause": scenario_pause, "stills": scenario_still_fade, "soak": scenario_soak}
+             "pause": scenario_pause, "stills": scenario_still_fade, "stream": scenario_stream,
+             "loopsfade": scenario_loops_fade, "default": scenario_default_restart,
+             "screenshot": scenario_screenshot, "splash": scenario_splash, "volume": scenario_volume, "soak": scenario_soak}
 
 
 def main():

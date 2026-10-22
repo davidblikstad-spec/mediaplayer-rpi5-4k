@@ -954,8 +954,6 @@ class PlayerEngine:
     def _item_args(self, item):
         """(load kwargs, play length in s or None) for a file/image item."""
         t = item["_type"]
-        vol = int(item.get("volume", 100)) if t != "image" else 100
-        fade_in = float(item.get("fade_in") or 0) if t != "image" else 0
         if t == "image":
             dur = float(item.get("duration") or 10)
             return dict(src=item["_abs"], kind="image", hold=dur), dur
@@ -1049,6 +1047,10 @@ class PlayerEngine:
 
     def _on_event(self, ev):
         name = ev.get("event")
+        # events of the gapless player name the item they are about; drop the
+        # ones for an item that was replaced while the event was in flight
+        if "slot" in ev and ev["slot"] != getattr(self.player, "current_slot_id", ev["slot"]):
+            return
         if name == "preload":
             self._preload_next()
             return

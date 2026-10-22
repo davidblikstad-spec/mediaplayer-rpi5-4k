@@ -36,8 +36,11 @@ See [`docs/playback-on-pi5.md`](docs/playback-on-pi5.md) for the hardware detail
 ## Features
 
 - **Web UI with login** (username + password, stored hashed; session cookie).
-- **Fullscreen HDMI playback** of videos and images via GStreamer on DRM/KMS,
-  scanned out onto a hardware plane.
+- **Fullscreen HDMI playback** of videos and images via GStreamer on DRM/KMS.
+- **Gapless playback:** no black frame between videos and images — the last
+  frame stays up until the next item is ready — and an optional **1–2 s
+  cross-fade** between the items of a playlist (see
+  [*Gapless playback and fades*](#gapless-playback-and-fades)).
 - **Transcoding (optional):** per-file **→ 1080p** (shrink to H.264) or
   **→ HEVC** (keep resolution — only useful with the hardware decoder enabled),
   plus an auto-on-upload policy. Runs in the background with a progress bar.
@@ -47,7 +50,7 @@ See [`docs/playback-on-pi5.md`](docs/playback-on-pi5.md) for the hardware detail
   - **In / out trim** (videos) and **display duration** (images),
   - **Loop count** — a fixed number of times or **always**,
   - **Volume** (0–130) with **fade-in** and **fade-out** (videos),
-- **Loop the whole playlist** on/off.
+- **Loop the whole playlist** on/off, and **fade between items** (cut / 1 s / 1.5 s / 2 s).
 - **Default content** — an item looped forever whenever nothing else is playing.
 - **Scheduling** (day-of-week + time) of playing a playlist, stopping, or
   **HDMI-CEC** display **On / Off / Set-as-source**.
@@ -88,6 +91,51 @@ Note: run from the **active console**, not over SSH — the player needs DRM
 master to show video, so video output and the live snapshot only work on the
 console (or via the systemd service).
 
+## Gapless playback and fades
+
+The original player built a new pipeline for every item, so the screen went
+black for a moment while the DRM plane changed hands. The gapless player
+(`app/mixer.py`, on by default) instead owns **one output pipeline that never
+stops** — `compositor` + `audiomixer` feeding `kmssink` / `alsasink` at a fixed
+canvas size — and each item is decoded by a `playbin3` of its own and fed into
+it. The next item is prepared a few seconds early, so a cut lands on the exact
+frame the previous item ends on. If the next item is ever late, the last frame
+simply stays on screen; it is never black. Trim, loops, volume/fades, live
+channels and subtitles work as before.
+
+- **Fade between items:** in a playlist, *Between items* → *Fade 1 s / 1.5 s /
+  2 s*, then *Save playlist*. The incoming item dissolves over the outgoing one
+  (picture and sound) for that long. *Cut (no black)* is the default. Skipping
+  with **Next**, or starting another playlist, is always a cut. A fade is
+  skipped for an item that loops on itself, and is shortened for items shorter
+  than twice the fade.
+- **Output resolution / frame rate** (*Settings → Playback*): everything is
+  scaled to one canvas. *Auto* is the TV's native mode (e.g. 3840×2160, so 4K
+  stills stay sharp); the cost is that 1080p video is upscaled in software.
+  **If playback stutters on a 4K TV, pick 1920×1080** — the TV then does the
+  scaling, as it did before. 25/30 fps is right for most content; 50/60 only
+  helps 50/60 fps video.
+- **Turning it off:** set `"gapless": false` under `settings` in
+  `data/config.json` (or start with `MEDIAPLAYER_LEGACY=1`) and restart to get
+  the original one-pipeline-per-item player back — black between items, no
+  fades. The same fallback happens automatically if a required GStreamer
+  element is missing; `data/mediaplayer.log` says which player started.
+- If the sound device can't be opened (wrong *Audio output*), the picture still
+  plays — silently — and the log says why.
+- The hardware HEVC decoder (`HW_HEVC_DECODE`) is not used by the gapless
+  player: frames are scaled and mixed in system memory.
+
+Check it without a display (works over SSH, no DRM needed):
+
+```bash
+./venv/bin/python scripts/mixer_selftest.py          # all scenarios, ~4 min
+./venv/bin/python scripts/mixer_selftest.py cut fade # just those
+```
+
+It plays generated clips through the real player into capturing sinks and
+checks for black frames, gaps, A/V sync, fades, loops, leaks and so on. It does
+not exercise `kmssink`/ALSA — for that, watch the screen.
+
 ## Transcoding, in practice
 
 - Upload your media in the **Media Library**. Each file is badged with how it
@@ -116,7 +164,7 @@ console (or via the systemd service).
 ## Layout
 
 ```
-app/            Flask app: config, media, gst player engine, transcode, cec, scheduler, routes
+app/            Flask app: config, media, gst player engine + legacy player, mixer (gapless player), transcode, cec, scheduler, routes
 app/templates/  login / setup / index pages
 app/static/     app.js + style.css
 data/config.json   all configuration (created on first run)

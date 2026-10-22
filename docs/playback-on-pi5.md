@@ -46,6 +46,10 @@ rules, and the Media Library badges each file accordingly.
 
 ## Playback path (in this repo)
 
+- **`app/mixer.py`** — the default player since the gapless rework: one
+  persistent output pipeline, items fed into it. See *Gapless playback* below.
+  Everything in the next two bullets describes the **legacy** `GstPlayer`
+  (`"gapless": false`), which is still in `app/gst.py` as the fallback.
 - **`app/gst.py`** — `GstPlayer` drives `playbin3` with `video-sink=kmssink`.
   playbin auto-plugs the decoder for the codec (hardware HEVC, or software for
   the rest). kmssink performs the vc4 atomic commit that puts a decoded NV12
@@ -55,6 +59,49 @@ rules, and the Media Library badges each file accordingly.
 - Still images: `filesrc ! decodebin ! imagefreeze ! videoconvert ! kmssink`.
 - Only one pipeline holds the DRM plane at a time; the other is set to NULL
   (releasing the plane) before the active one starts.
+
+## Gapless playback — `app/mixer.py`
+
+```
+playbin3 (item A) -> videoconvert ! videoscale ! I420 canvas ! appsink --\
+playbin3 (item B) -> ...                                                  +-> appsrc -> compositor -> videoconvert -> kmssink
+image / splash    -> ... ! imagefreeze num-buffers=1 ! appsink -----------/
+playbin3 (audio)  -> audioconvert ! audioresample ! F32 48k ! appsink -> appsrc -> audiomixer -> queue(leaky) -> alsasink
+```
+
+- **kmssink never renegotiates.** The canvas (size, 30 fps, BT.709) is fixed when
+  the output pipeline starts, so the DRM plane is never released or re-modeset
+  between items. A one-frame-per-second black layer sits underneath for "nothing
+  playing". Cost: video is scaled/blended in system memory instead of being
+  scanned out zero-copy — roughly 30 % of a core for 1080p on a 1080p canvas and
+  65 % on a 4K canvas on a desktop x86 core; the Pi will be slower. Use
+  *Settings → Output resolution* to trade sharpness for CPU.
+- **Timing.** Item pipelines run with `sync=false` appsinks, so they decode
+  ahead only as far as the bounded appsrc queues (~0.3 s) allow. Each buffer's
+  running time is mapped onto the output timeline as `origin + running_time`,
+  where the origin is chosen when the item's first buffer arrives: the previous
+  item's end (a cut), `end − fade` (a fade), or now (a skip). Audio and video of
+  an item share one origin, so they stay in sync.
+- **Preloading.** `PlayerEngine` asks the player to `preload()` the next item
+  ~4 s before the current one ends (a `playbin3` prerolled to PAUSED); `load()`
+  of the same item then only switches it to PLAYING. Live streams are not
+  preloaded (they resolve a fresh URL at play time).
+- **Fades.** The incoming item's compositor pad ramps `alpha` 0→1 and its
+  audiomixer pad `volume` sin(0→π/2); the outgoing item's volume follows cos.
+  The outgoing item's pads are released once the incoming item has been on
+  screen for the fade length.
+- **Item volume / fade-in / fade-out** still drive the item's `playbin3` volume.
+- **Audio can't take the picture down:** the audio sink sits behind a leaky
+  queue, is not the pipeline clock (see `GstPlayer._make_audio_sink`), and if it
+  can't be opened at all the output pipeline falls back to a silent sink.
+- **Leaks** that were found and fixed while building it, worth knowing if you
+  touch it: PyGObject leaks the `GstBus` (2 fds + memory) of any pipeline that
+  has had `bus.set_sync_handler()` called, so buses are polled instead; and the
+  appsink callbacks hold the slot, which holds the pipeline, so `_release()`
+  disconnects them. `run.py` also sets `M_ARENA_MAX=2`, otherwise glibc's
+  per-thread arenas fragment the heap to several hundred MB (it levels off).
+
+`scripts/mixer_selftest.py` is the regression test (see the README).
 
 ## Transcoding (optional) — `app/transcode.py`
 

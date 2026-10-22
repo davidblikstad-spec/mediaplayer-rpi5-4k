@@ -105,6 +105,11 @@ function renderPlaylistItems() {
   tb.innerHTML = "";
   if (!pl) { $("#pl-loop").checked = false; return; }
   $("#pl-loop").checked = !!pl.loop_playlist;
+  $("#pl-transition").value = String(pl.transition_s || 0);
+  // fades need the gapless player; say so if the legacy one is running
+  const fadeOk = cfg.gapless_active !== false;
+  $("#pl-transition").disabled = !fadeOk;
+  $("#pl-transition-note").classList.toggle("hidden", fadeOk);
   pl.items.forEach((it, i) => tb.appendChild(itemRow(it, i)));
 }
 
@@ -192,13 +197,16 @@ function collectItems() {
     return o;
   });
 }
+function transitionValue() { return parseFloat($("#pl-transition").value) || 0; }
 async function persistPlaylist(pl) {
-  await api("PUT", "/api/playlists/" + pl.id, { items: pl.items, loop_playlist: pl.loop_playlist });
+  await api("PUT", "/api/playlists/" + pl.id,
+    { items: pl.items, loop_playlist: pl.loop_playlist, transition_s: pl.transition_s || 0 });
 }
 $("#pl-save").onclick = async () => {
   const pl = curPlaylist(); if (!pl) return;
   pl.items = collectItems();
   pl.loop_playlist = $("#pl-loop").checked;
+  pl.transition_s = transitionValue();
   await persistPlaylist(pl);
   toast("Playlist saved");
 };
@@ -229,6 +237,7 @@ $("#pl-add").onclick = async () => {
     const cur = curPlaylist(); if (!cur) return;
     cur.items = collectItems();              // keep any unsaved edits in existing rows
     cur.loop_playlist = $("#pl-loop").checked;
+    cur.transition_s = transitionValue();
     const it = { id: rid(), file: m.file, type: m.type };
     if (m.type === "image") { it.duration = 10; it.loop = 1; }
     else { it.in = 0; it.out = null; it.loop = 1; it.volume = 100; it.fade_in = 0; it.fade_out = 0; }
@@ -251,6 +260,7 @@ $("#pl-add-stream").onclick = async () => {
       const cur = curPlaylist(); if (!cur) return;
       cur.items = collectItems();
       cur.loop_playlist = $("#pl-loop").checked;
+      cur.transition_s = transitionValue();
       cur.items.push({ id: rid(), type: "stream", provider: "nrk", channel: ch.id,
         name: ch.name, duration: null, subtitles: false, volume: 100, fade_in: 0, fade_out: 0 });
       renderPlaylistItems();
@@ -525,6 +535,8 @@ function renderSettings() {
   $("#set-avdelay").value = s.stream_av_delay_ms ?? 0;
   $("#set-resync").value = Math.round((s.stream_resync_interval_s ?? 3600) / 60);
   $("#set-ao").value = (s.audio_out || "auto").replace(/^alsa\//, "");
+  $("#set-res").value = s.output_resolution || "auto";
+  $("#set-fps").value = String(s.output_fps || 30);
   // The "To HEVC" policy only pays off via the hardware decoder; drop it from
   // the menu while that is disabled (and fall back to "Off" if it was the
   // saved value, so the select doesn't show a blank).
@@ -560,6 +572,8 @@ $("#set-save").onclick = async () => {
     stream_av_delay_ms: parseInt($("#set-avdelay").value) || 0,
     stream_resync_interval_s: (parseInt($("#set-resync").value) || 0) * 60,
     audio_out: $("#set-ao").value,
+    output_resolution: $("#set-res").value,
+    output_fps: parseInt($("#set-fps").value) || 30,
     transcode_policy: $("#set-tc-policy").value,
     default_item: def,
   });

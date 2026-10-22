@@ -77,6 +77,8 @@ PRELOAD_AHEAD_S = 4.0
 # How long to keep an outgoing item's pads after its successor's first frame
 # is on screen (a hard cut) — covers the compositor's own latency.
 RETIRE_MARGIN_NS = 150 * MSEC
+# How long to wait before reporting "can't show anything" (no output pipeline).
+OUT_RETRY_S = 3.0
 # Output timeline tick: ramps, retiring old items, delivering timed events.
 TICK_S = 0.02
 # Compositor / audiomixer extra latency (ns): tolerance for late upstream data.
@@ -172,9 +174,10 @@ class _Slot:
 class _Out:
     """The persistent output pipeline: compositor + audiomixer + the real sinks."""
 
-    def __init__(self, width, height, fps, make_vsink, make_asink, log):
+    def __init__(self, width, height, fps, make_vsink, make_asink, log, silent=False):
         self.w, self.h, self.fps = width, height, fps
         self.log = log
+        self.silent = silent             # audio goes to a fakesink (device unusable)
         self.ok = False
         self._zorder = itertools.count(1)
         self._warned = set()
@@ -214,7 +217,9 @@ class _Out:
         aq.set_property("max-size-bytes", 0)
         aq.set_property("max-size-buffers", 0)
         aq.set_property("leaky", 2)                          # downstream
-        self.asink = make_asink()
+        self.asink = mk("fakesink", None) if silent else make_asink()
+        if silent:
+            self.asink.set_property("sync", True)
         silence = mk("audiotestsrc", None)
         silence.set_property("wave", 4)                      # silence
         silence.set_property("is-live", True)
@@ -252,7 +257,7 @@ class _Out:
                 return errors
             if msg.type == Gst.MessageType.ERROR:
                 err, dbg = msg.parse_error()
-                errors.append("%s (%s)" % (err, dbg))
+                errors.append("%s: %s (%s)" % (msg.src.get_name() if msg.src else "?", err, dbg))
             elif msg.type == Gst.MessageType.WARNING:
                 w, dbg = msg.parse_warning()
                 text = str(w.message)
@@ -364,6 +369,7 @@ class MixerPlayer(_gst.GstPlayer):
         self._worker = None
         self._out_lock = threading.RLock()
         self._stop_at = None               # out time to blank the screen at (graceful stop)
+        self._out_err = {}                 # output-pipeline error text -> when last logged
 
     # ---- sinks ---------------------------------------------------------
     def _default_vsink(self):
@@ -433,18 +439,40 @@ class MixerPlayer(_gst.GstPlayer):
                 _gst.wait_for_hdmi(self.log)
             w, h = self._canvas()
             fps = self._fps()
-            try:
-                out = _Out(w, h, fps, self._make_vsink, self._make_asink, self.log)
-            except Exception as e:  # noqa
-                self.log("output pipeline: %s" % e)
-                return False
-            if not out.start():
-                self.log("output pipeline failed to start")
+            silent = False
+            while True:
+                try:
+                    out = _Out(w, h, fps, self._make_vsink, self._make_asink, self.log,
+                               silent=silent)
+                except Exception as e:  # noqa
+                    self.log("output pipeline: %s" % e)
+                    return False
+                if out.start():
+                    break
+                why = "; ".join(out.poll()) or "no error posted"
                 out.stop()
+                if not silent and ("alsa" in why.lower() or "audio device" in why.lower()):
+                    # A sound device that can't be opened (wrong device chosen,
+                    # card missing) must not take the picture down with it.
+                    self._log_out_error("audio device unusable (%s); playing without sound "
+                                        "until the next restart" % why.split(" (")[0])
+                    silent = True
+                    continue
+                self._log_out_error("output pipeline failed to start: %s" % why)
                 return False
             self.out = out
-            self.log("output pipeline up: %dx%d @ %d fps" % (w, h, fps))
+            self.log("output pipeline up: %dx%d @ %d fps%s"
+                     % (w, h, fps, " (silent)" if silent else ""))
             return True
+
+    def _log_out_error(self, text):
+        """With the TV off the output pipeline is retried every few seconds:
+        say it once (and again every 5 minutes), not 30 000 times a day."""
+        key = re.sub(r"\d+", "#", text.split(" (")[0])
+        now = time.monotonic()
+        if now - self._out_err.get(key, -1e9) > 300:
+            self._out_err[key] = now
+            self.log(text)
 
     def is_alive(self):
         return self._worker is not None and self._worker.is_alive()
@@ -485,9 +513,8 @@ class MixerPlayer(_gst.GstPlayer):
             % AUDIO_CAPS, True)
 
     def _build(self, kind, src, start, end, hold, subtitles, length=None, volume=None):
-        """Create a slot and preroll its source pipeline to PAUSED."""
-        if not self._ensure_out():
-            return None
+        """Create a slot and preroll its source pipeline to PAUSED (the output
+        pipeline must be up: see _ensure_out)."""
         slot = _Slot(kind, src, start, end, hold, subtitles)
         if length:
             slot.length_ns = int(float(length) * SEC)
@@ -549,15 +576,15 @@ class MixerPlayer(_gst.GstPlayer):
         if slot.kind == "image":
             desc = "filesrc name=src ! decodebin ! " + scale
         else:
+            text = ("textoverlay name=t valignment=center halignment=center "
+                    "line-alignment=center font-desc=\"Sans, %d\" ! " % max(12, h // 32)
+                    if Gst.ElementFactory.find("textoverlay") else "")   # gstreamer1.0-x
             desc = ("videotestsrc pattern=black num-buffers=1 ! "
-                    "video/x-raw,width=%d,height=%d,framerate=1/1 ! "
-                    "textoverlay name=t valignment=center halignment=center "
-                    "line-alignment=center font-desc=\"Sans, %d\" ! " % (w, h, max(12, h // 32))
-                    + scale)
+                    "video/x-raw,width=%d,height=%d,framerate=1/1 ! " % (w, h) + text + scale)
         pipe = Gst.parse_launch(desc)
         if slot.kind == "image":
             pipe.get_by_name("src").set_property("location", slot.src)
-        else:
+        elif pipe.get_by_name("t") is not None:
             pipe.get_by_name("t").set_property("text", slot.src)
         slot.pipe = pipe
         slot.vsink = pipe.get_by_name("vsink")
@@ -661,6 +688,11 @@ class MixerPlayer(_gst.GstPlayer):
             self._cur_start = float(start or 0.0)
             self._cur_kind = kind
             self._paused = False
+            if not self._ensure_out():
+                # No display to show it on (TV off, HDMI not up). Report the
+                # failure slowly, or the engine would spin through the playlist.
+                self._fail_later(OUT_RETRY_S)
+                return
             key = _Slot(kind, src, start, end, hold, subtitles).key
             cur = self.cur
             if (cur is not None and not cur.dead and cur.key == key and kind != "stream"
@@ -677,10 +709,21 @@ class MixerPlayer(_gst.GstPlayer):
             if slot is None:
                 slot = self._build(kind, src, start, end, hold, subtitles, length, volume)
             if slot is None:
-                threading.Timer(0.05, self._emit,
-                                args=({"event": "end-file", "reason": "error"},)).start()
+                self._fail_later(0.05)                   # this item is the problem: move on
                 return
             self._start_slot(slot, transition)
+
+    @property
+    def current_slot_id(self):
+        """Lets the engine drop events that were queued for an item that has
+        since been replaced (e.g. by a manual skip)."""
+        cur = self.cur
+        return cur.id if cur is not None else None
+
+    def _fail_later(self, delay):
+        t = threading.Timer(delay, self._emit, args=({"event": "end-file", "reason": "error"},))
+        t.daemon = True
+        t.start()
 
     def _retune(self, slot, hold, length, volume):
         """Apply the per-load details to a slot that was preloaded without them."""
@@ -698,7 +741,7 @@ class MixerPlayer(_gst.GstPlayer):
         """Prepare the next item (decoder open, first frame ready) without
         showing it. A following load() with the same arguments is instant."""
         with self._lock:
-            if self.cur is None or self.cur.dead:
+            if self.cur is None or self.cur.dead or self.out is None or not self.out.ok:
                 return
             key = _Slot(kind, src, start, end, hold, subtitles).key
             if self.cur.key == key or (self.next is not None and self.next.key == key):
@@ -787,6 +830,8 @@ class MixerPlayer(_gst.GstPlayer):
             self._stop_at = None
             self._cur_kind = "splash"
             self._cur_path = None
+            if not self._ensure_out():
+                return
             slot = self._build("splash", text, 0, None, None, False)
             if slot is not None:
                 self._start_slot(slot, 0)
@@ -916,12 +961,12 @@ class MixerPlayer(_gst.GstPlayer):
             if slot is not self.cur or slot.kind in ("image", "splash") or slot.eof_sent:
                 return []
             slot.eof_sent = True
-            return [{"event": "end-file", "reason": "eof"}]
+            return [{"event": "end-file", "reason": "eof", "slot": slot.id}]
         if kind == "error":
             self.log("gst error: %s" % text)
             if slot is self.cur and not slot.eof_sent:
                 slot.eof_sent = True
-                return [{"event": "end-file", "reason": "error"}]
+                return [{"event": "end-file", "reason": "error", "slot": slot.id}]
             if slot is self.next:
                 self._dispose(slot)
                 self.next = None
@@ -950,14 +995,14 @@ class MixerPlayer(_gst.GstPlayer):
             xf = min(cur.xfade_ns, (cur.length_ns or 0) // 2)
             if not cur.preload_sent and left <= PRELOAD_AHEAD_S * SEC + xf:
                 cur.preload_sent = True
-                events.append({"event": "preload"})
+                events.append({"event": "preload", "slot": cur.id})
             if xf and not cur.ate_sent and left - xf <= TRIGGER_AHEAD_NS:
                 cur.ate_sent = True
-                events.append({"event": "about-to-end"})
+                events.append({"event": "about-to-end", "slot": cur.id})
             if (cur.kind in ("image", "splash", "stream") and cur.hold
                     and not cur.eof_sent and left <= HANDOFF_NS):
                 cur.eof_sent = True
-                events.append({"event": "end-file", "reason": "eof"})
+                events.append({"event": "end-file", "reason": "eof", "slot": cur.id})
         return events
 
     def _ramp(self, cur, now):

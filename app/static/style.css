@@ -103,3 +103,4 @@ table.items input.vol{width:56px}
 .modal video,.modal img{max-width:80vw;max-height:70vh;display:block}
 .picker-list{display:grid;grid-template-columns:repeat(auto-fill,minmax(130px,1fr));gap:.6rem;margin-top:.6rem}
 .picker-list .media-card{cursor:pointer}
+#pl-transition-note.hidden{display:none}

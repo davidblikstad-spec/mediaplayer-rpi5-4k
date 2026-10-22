@@ -61,6 +61,15 @@
       </div>
       <div class="card">
         <label class="inline"><input type="checkbox" id="pl-loop"> Loop whole playlist</label>
+        <label class="inline" title="How one item hands over to the next. Cuts are always gapless — the last frame stays until the next one is ready, never black.">Between items
+          <select id="pl-transition">
+            <option value="0">Cut (no black)</option>
+            <option value="1">Fade 1 s</option>
+            <option value="1.5">Fade 1.5 s</option>
+            <option value="2">Fade 2 s</option>
+          </select>
+        </label>
+        <span id="pl-transition-note" class="muted hidden">needs the gapless player (see Settings)</span>
         <button id="pl-add" class="small">+ Add file</button>
         <button id="pl-add-stream" class="small">+ Add live channel</button>
         <button id="pl-save" class="primary small">Save playlist</button>
@@ -130,9 +139,33 @@
           <span class="muted">Applied on Save (briefly reloads the current item).</span>
         </div>
         <div class="row">
+          <label>Output resolution
+            <select id="set-res">
+              <option value="auto">Auto (the TV's native mode)</option>
+              <option value="3840x2160">3840×2160 (4K)</option>
+              <option value="2560x1440">2560×1440</option>
+              <option value="1920x1080">1920×1080 (lightest on the CPU)</option>
+              <option value="1280x720">1280×720</option>
+            </select>
+          </label>
+          <label>Output frame rate
+            <select id="set-fps">
+              <option value="25">25 fps</option>
+              <option value="30">30 fps</option>
+              <option value="50">50 fps</option>
+              <option value="60">60 fps</option>
+            </select>
+          </label>
+          <span class="muted">Gapless player only: everything is scaled to this canvas, so
+            a lower resolution means less CPU (the TV scales it up). Applied on Save
+            (briefly reloads the current item).</span>
+        </div>
+        <div class="row">
           <label>HDMI snapshot interval (s)<input id="set-snap" type="number" min="1" value="5"></label>
           <label>Live stream audio delay (ms, 0=auto)<input id="set-avdelay" type="number" min="0" step="10" value="0"></label>
           <label>Live stream audio re-sync (min, 0=off)<input id="set-resync" type="number" min="0" step="1" value="60"></label>
+          <span class="muted">Re-sync only applies to the legacy player; the gapless player keeps
+            audio and video on one timeline.</span>
         </div>
       </div>
       <div class="card">

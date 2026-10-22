@@ -42,6 +42,8 @@ def _public_config(cfg):
     # Build-time capability, not a user setting: the UI hides the "→ HEVC"
     # transcode option (and its badge) while the hardware decoder is disabled.
     c["hw_hevc_decode"] = config.HW_HEVC_DECODE
+    # Which player is running: only the gapless one can fade between items.
+    c["gapless_active"] = bool(getattr(gstmod.player, "supports_transitions", False))
     return c
 
 
