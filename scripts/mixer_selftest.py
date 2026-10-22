@@ -432,6 +432,7 @@ def scenario_soak(media):
             return int(f.read().split()[1]) * os.sysconf("SC_PAGE_SIZE") // (1 << 20)
     print("scenario: soak (leaks)")
     r = Rig()
+    r.player._frame_stats_s = 20
     items = [item(media, "red.mp4", **{"in": 0, "out": 1.0, "_test_dur": 6}),
              item(media, "blue.png", duration=1.0),
              item(media, "green.mp4", **{"in": 0, "out": 1.0, "_test_dur": 6}),
@@ -455,6 +456,11 @@ def scenario_soak(media):
     check(nodes < 40, "output pipeline does not accumulate elements (%d)" % nodes)
     check(not black_frames_after_start(r.cap), "no black frame in %d frames" % len(r.cap.frames))
     check(not [m for m in r.log_lines if "error" in m.lower() or "fail" in m.lower()], "no errors logged")
+    stats = [m for m in r.log_lines if m.startswith("frames, last")]
+    print("  " + (stats[-1] if stats else "no frame counter logged"))
+    check(len(stats) >= 3, "the frame counter is logged periodically (%d times)" % len(stats))
+    check(stats and all(" 0 dropped" in m and " 0 late" in m for m in stats),
+          "no frames dropped or late")
     r.stop()
 
 

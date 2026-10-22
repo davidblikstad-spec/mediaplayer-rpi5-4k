@@ -87,6 +87,8 @@ MIXER_LATENCY_NS = 40 * MSEC
 # (whose live sources report a few ms of min latency) reject — they then fall
 # back to waiting for every pad forever, so one silent video stalls the audio.
 APPSRC_MAX_LATENCY_NS = 5 * SEC
+# How often to log the output's frame counters (shown / dropped / late).
+FRAME_STATS_S = 300
 # Appsrc queue sizes
 VIDEO_QUEUE_FRAMES = 6
 AUDIO_QUEUE_S = 0.3
@@ -181,6 +183,7 @@ class _Out:
         self.ok = False
         self._zorder = itertools.count(1)
         self._warned = set()
+        self.late = 0                    # video frames that reached the compositor too late
         self.pipe = Gst.Pipeline.new("out")
         self.bus = self.pipe.get_bus()
         self.pipe.use_clock(Gst.SystemClock.obtain())
@@ -343,6 +346,18 @@ class _Out:
         except Exception:
             return None
 
+    def frame_counts(self):
+        """(shown, dropped, late) since the pipeline started. Shown and dropped
+        are the video sink's own counters (kmssink drops a frame it can't put on
+        screen in time); late counts source frames the compositor had already
+        moved past when they arrived, i.e. the decoder fell behind. None if the
+        sink has no statistics."""
+        try:
+            st = self.vsink.get_property("stats")
+            return st.get_value("rendered"), st.get_value("dropped"), self.late
+        except Exception:
+            return None
+
 
 class MixerPlayer(_gst.GstPlayer):
     """Drop-in replacement for GstPlayer with gapless playback and cross-fades."""
@@ -370,6 +385,8 @@ class MixerPlayer(_gst.GstPlayer):
         self._out_lock = threading.RLock()
         self._stop_at = None               # out time to blank the screen at (graceful stop)
         self._out_err = {}                 # output-pipeline error text -> when last logged
+        self._frame_stats_s = FRAME_STATS_S
+        self._frame_mark = None            # (out, monotonic time, frame_counts()) last logged
 
     # ---- sinks ---------------------------------------------------------
     def _default_vsink(self):
@@ -666,6 +683,8 @@ class MixerPlayer(_gst.GstPlayer):
         end = out_pts + dur
         if end > slot.last_end:
             slot.last_end = end
+        if is_video and dur and end + MIXER_LATENCY_NS < self.out.now_ns():
+            self.out.late += 1
         ret = src.emit("push-buffer", nb)
         return Gst.FlowReturn.OK if ret in (Gst.FlowReturn.OK, Gst.FlowReturn.FLUSHING,
                                              Gst.FlowReturn.EOS) else ret
@@ -981,6 +1000,7 @@ class MixerPlayer(_gst.GstPlayer):
             self.log("output pipeline error: %s" % text)
             out.ok = False
             events.append({"event": "out-failed"})
+        self._log_frame_stats(out)
         now = out.now_ns()
         if self._stop_at is not None and now >= self._stop_at:
             self._stop_at = None
@@ -1004,6 +1024,24 @@ class MixerPlayer(_gst.GstPlayer):
                 cur.eof_sent = True
                 events.append({"event": "end-file", "reason": "eof", "slot": cur.id})
         return events
+
+    def _log_frame_stats(self, out):
+        """Every few minutes, log how many frames reached the screen and how
+        many were lost, so stutter can be told apart from content judder."""
+        t = time.monotonic()
+        mark = self._frame_mark
+        if mark is not None and mark[0] is out and t - mark[1] < self._frame_stats_s:
+            return
+        counts = out.frame_counts()
+        if counts is None:
+            return
+        self._frame_mark = (out, t, counts)
+        if mark is None or mark[0] is not out:
+            return                                    # new pipeline: just set the baseline
+        shown, dropped, late = (a - b for a, b in zip(counts, mark[2]))
+        span = t - mark[1]
+        self.log("frames, last %d s: %d shown (%.1f fps of %d), %d dropped at the screen, "
+                 "%d late from the decoder" % (span, shown, shown / span, out.fps, dropped, late))
 
     def _ramp(self, cur, now):
         """Drive the cross-fade: the new item's alpha and volume up, the old one's down."""
